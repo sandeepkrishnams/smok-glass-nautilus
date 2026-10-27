@@ -18,7 +18,7 @@ The metadata scan runs on a background worker after a short delay, with live pro
 
 Sizes are logical file sizes, not allocated disk blocks. Child symlinks are counted without traversing their targets, and links/special files add no size. Hard-linked files count once per listed path. The default scan limits are **5 million items and 120 seconds**, configurable in **Preferences → Folder Usage Preview** (also available through **Scan settings** in the pane). Changes apply to the next scan. **Scan without limits** starts a fresh scan that bypasses the item/time limits once; normal rescans restore your configured limits. Stop, cancellation, and the 64-level traversal-depth bound remain in effect. Time limits are checked between metadata operations. Unreadable paths and limits produce clearly labelled partial totals, with **≥** on the size and “counted so far” on item counts. The scan keeps only bounded aggregates and directory cursors, rather than a list of every descendant.
 
-<img src="docs/screenshots/folder-overview.png" alt="Folder usage donut showing subfolder sizes, percentages, loose files, and total item counts" width="390">
+![Smoked-glass Nautilus showing sample files alongside the folder usage donut, item counts, and scan controls](docs/screenshots/folder-usage-desktop.png)
 
 ### Spreadsheet preview
 
