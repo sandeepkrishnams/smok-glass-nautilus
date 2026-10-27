@@ -8,6 +8,7 @@
 | --- | --- |
 | Folders | Cancellable GIO enumeration off the main thread → sorted, read-only GTK list |
 | Text/Markdown | Bounded file reads, GtkTextView, local CommonMark rendering |
+| Local videos | Debounced GtkMediaFile → GtkVideo with GStreamer playback controls |
 | Images | Glycin sandboxed decode, GtkPicture |
 | PDF | Poppler page rasterization, Glycin texture loading |
 | DOCX/ODT/DOC/RTF | Headless LibreOffice → PDF → page rasterization |
@@ -24,3 +25,7 @@ The spreadsheet view has JavaScript disabled and a restrictive Content Security 
 The source tree includes original upstream components and tests. `src/nautilus-preview-check.c` provides extra native integration checks. `tests/test_document_previews.py` tests the helper layer without requiring a display.
 
 Folder enumeration supports local and GIO-backed locations, including mounted network folders. It reads only immediate child metadata without following child symlinks. It caps visible results at 500 and scanned entries at 10,000, then sorts the bounded result with folders first and natural filename collation. Hidden/backup entries follow the GTK file chooser preference, including changes while a folder is selected. No recursive size calculation or file-content reads are performed.
+
+Video streams load paused after the selection debounce. Prepared/error notifications update only the current stream; cancellation disconnects notifications, pauses, detaches, clears, and releases it. Videos are decoded by the installed GTK media backend, not Glycin or the office sandbox. They are local-only and do not use the image/document size cap.
+
+A capture-phase pointer motion controller on the slot’s content stack resolves grid/list cells without changing selection. A 350 ms dwell precedes the existing 120 ms loader debounce. Crossing items replaces pending hover work; leaving restores the selection. Selection, navigation, hiding, and disposal clear hover state. Pointer motion with pressed mouse buttons does not initiate previews.

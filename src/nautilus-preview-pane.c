@@ -24,6 +24,8 @@ struct _NautilusPreviewPane
     GtkLabel *message;
     GtkStack *stack;
     GtkPicture *picture;
+    GtkVideo *video;
+    GtkMediaStream *media;
     GtkTextView *text;
     GtkToggleButton *source;
     GtkWidget *open;
@@ -496,10 +498,63 @@ preview_loaded (GObject *object, GAsyncResult *result, gpointer data)
     }
 }
 
+/* Only the selected stream can update the pane; detached streams have no callbacks. */
+static void
+video_state_changed (GtkMediaStream *stream, GParamSpec *pspec, NautilusPreviewPane *self)
+{
+    if (stream != self->media) return;
+    const GError *error = gtk_media_stream_get_error (stream);
+    if (error != NULL)
+    {
+        g_autofree char *message = g_strdup_printf (
+            "Video preview unavailable: %s\nTry Open in application, or install the required GStreamer codec.", error->message);
+        gtk_label_set_text (self->message, message);
+        gtk_stack_set_visible_child_name (self->stack, "message");
+        gtk_media_stream_pause (stream);
+    }
+    else if (gtk_media_stream_is_prepared (stream))
+    {
+        if (!gtk_media_stream_has_video (stream))
+        {
+            gtk_label_set_text (self->message, "This file does not contain a video track. Use Open in application.");
+            gtk_stack_set_visible_child_name (self->stack, "message");
+            return;
+        }
+        gint64 seconds = gtk_media_stream_get_duration (stream) / G_USEC_PER_SEC;
+        g_autofree char *metadata = seconds > 0 ?
+            g_strdup_printf ("Video · %" G_GINT64_FORMAT ":%02" G_GINT64_FORMAT " · press Play to preview", seconds / 60, seconds % 60) :
+            g_strdup ("Video · press Play to preview");
+        gtk_label_set_text (self->metadata, metadata);
+        gtk_stack_set_visible_child_name (self->stack, "video");
+    }
+}
+
+static gboolean
+start_video_preview (gpointer data)
+{
+    NautilusPreviewPane *self = data;
+    self->load_source = 0;
+    self->media = gtk_media_file_new ();
+    g_signal_connect (self->media, "notify::prepared", G_CALLBACK (video_state_changed), self);
+    g_signal_connect (self->media, "notify::error", G_CALLBACK (video_state_changed), self);
+    gtk_video_set_media_stream (self->video, self->media);
+    gtk_media_file_set_file (GTK_MEDIA_FILE (self->media), self->file);
+    video_state_changed (self->media, NULL, self);
+    return G_SOURCE_REMOVE;
+}
+
 void
 nautilus_preview_pane_cancel (NautilusPreviewPane *self)
 {
     self->serial++;
+    if (self->media != NULL)
+    {
+        g_signal_handlers_disconnect_by_data (self->media, self);
+        gtk_media_stream_pause (self->media);
+        gtk_video_set_media_stream (self->video, NULL);
+        gtk_media_file_clear (GTK_MEDIA_FILE (self->media));
+        g_clear_object (&self->media);
+    }
     if (self->cancellable != NULL) g_cancellable_cancel (self->cancellable);
     g_clear_object (&self->cancellable);
     if (self->load_source != 0)
@@ -656,6 +711,13 @@ nautilus_preview_pane_set_files (NautilusPreviewPane *self, GList *files)
         gtk_label_set_text (self->message, "Open this remote file to view its contents.");
         return;
     }
+    if (mime != NULL && g_str_has_prefix (mime, "video/"))
+    {
+        gtk_label_set_text (self->message, "Loading preview…");
+        self->load_source = g_timeout_add_full (G_PRIORITY_DEFAULT, 120, start_video_preview,
+                                               g_object_ref (self), g_object_unref);
+        return;
+    }
     gboolean image = mime != NULL && g_str_has_prefix (mime, "image/");
     g_autofree char *lower_name = g_ascii_strdown (name, -1);
     const char *kinds[] = {"pdf", "docx", "xlsx", "odt", "ods", "csv", "tsv", "doc", "xls", "rtf"};
@@ -776,6 +838,13 @@ nautilus_preview_pane_init (NautilusPreviewPane *self)
     gtk_picture_set_can_shrink (self->picture, TRUE);
     gtk_picture_set_content_fit (self->picture, GTK_CONTENT_FIT_CONTAIN);
     gtk_stack_add_named (self->stack, GTK_WIDGET (self->picture), "image");
+    self->video = GTK_VIDEO (gtk_video_new ());
+    gtk_video_set_autoplay (self->video, FALSE);
+    gtk_video_set_loop (self->video, FALSE);
+    gtk_widget_set_size_request (GTK_WIDGET (self->video), 240, 160);
+    gtk_widget_set_hexpand (GTK_WIDGET (self->video), TRUE);
+    gtk_widget_set_vexpand (GTK_WIDGET (self->video), TRUE);
+    gtk_stack_add_named (self->stack, GTK_WIDGET (self->video), "video");
     self->text = GTK_TEXT_VIEW (gtk_text_view_new ());
     gtk_text_view_set_editable (self->text, FALSE);
     gtk_text_view_set_cursor_visible (self->text, FALSE);

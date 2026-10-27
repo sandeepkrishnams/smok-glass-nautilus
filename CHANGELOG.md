@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Local video previews with native playback controls, duration, seeking, paused loading, and cleanup on selection changes or hiding.
+- Delayed hover previews in grid/list views without changing selection, restoring the selected preview when the pointer leaves.
+
 - Selecting a folder previews its files and subfolders, with icons, sizes, folder-first sorting, and an item summary.
 - Folder listings also work with GIO-backed locations, including mounted SMB shares, and handle optional network metadata.
 - Folder previews respect hidden-item visibility, show empty/error states, and cap large listings while keeping selection cancellable.

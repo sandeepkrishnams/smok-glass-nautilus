@@ -24,6 +24,8 @@
 
 #include "nautilus-window-slot.h"
 #include "nautilus-preview-pane.h"
+#include "nautilus-view-cell.h"
+#include "nautilus-view-item.h"
 
 #include "nautilus-application.h"
 #include "nautilus-bookmark.h"
@@ -93,6 +95,9 @@ struct _NautilusWindowSlot
 
     GtkWidget *stack;
     NautilusPreviewPane *preview_pane;
+    NautilusFile *preview_hover_file;
+    guint preview_hover_timeout;
+    gboolean preview_hover_active;
     GtkWidget *vbox;
     AdwStatusPage *global_search_page;
 
@@ -634,9 +639,99 @@ nautilus_window_slot_add_extra_location_widget (NautilusWindowSlot *self,
 }
 
 static void
+clear_preview_hover (NautilusWindowSlot *self, gboolean restore)
+{
+    g_clear_handle_id (&self->preview_hover_timeout, g_source_remove);
+    g_clear_object (&self->preview_hover_file);
+    gboolean active = self->preview_hover_active;
+    self->preview_hover_active = FALSE;
+    if (restore && active && self->preview_pane != NULL &&
+        gtk_widget_get_visible (GTK_WIDGET (self->preview_pane)))
+        nautilus_preview_pane_set_files (self->preview_pane, self->selection);
+}
+
+static gboolean
+show_hover_preview (gpointer data)
+{
+    NautilusWindowSlot *self = data;
+    self->preview_hover_timeout = 0;
+    if (self->preview_pane != NULL && self->preview_hover_file != NULL &&
+        gtk_widget_get_visible (GTK_WIDGET (self->preview_pane)))
+    {
+        if (self->selection != NULL && self->selection->next == NULL &&
+            self->selection->data == self->preview_hover_file)
+        {
+            if (self->preview_hover_active)
+                nautilus_preview_pane_set_files (self->preview_pane, self->selection);
+            self->preview_hover_active = FALSE;
+            return G_SOURCE_REMOVE;
+        }
+        GList files = { .data = self->preview_hover_file };
+        self->preview_hover_active = TRUE;
+        nautilus_preview_pane_set_files (self->preview_pane, &files);
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static void
+preview_pointer_leave (GtkEventControllerMotion *controller, NautilusWindowSlot *self)
+{
+    clear_preview_hover (self, TRUE);
+}
+
+static gboolean
+preview_pointer_scroll (GtkEventControllerScroll *controller, double dx, double dy,
+                        NautilusWindowSlot *self)
+{
+    clear_preview_hover (self, TRUE);
+    return GDK_EVENT_PROPAGATE;
+}
+
+static void
+preview_content_unmapped (GtkWidget *widget, NautilusWindowSlot *self)
+{
+    clear_preview_hover (self, FALSE);
+    if (self->preview_pane != NULL) nautilus_preview_pane_cancel (self->preview_pane);
+}
+
+static void
+preview_content_mapped (GtkWidget *widget, NautilusWindowSlot *self)
+{
+    if (self->preview_pane != NULL && gtk_widget_get_visible (GTK_WIDGET (self->preview_pane)))
+        nautilus_preview_pane_set_files (self->preview_pane, self->selection);
+}
+
+static void
+preview_pointer_motion (GtkEventControllerMotion *controller, double x, double y,
+                        NautilusWindowSlot *self)
+{
+    if (self->preview_pane == NULL || !gtk_widget_get_visible (GTK_WIDGET (self->preview_pane))) return;
+    GdkModifierType state = gtk_event_controller_get_current_event_state (GTK_EVENT_CONTROLLER (controller));
+    if (state & (GDK_BUTTON1_MASK | GDK_BUTTON2_MASK | GDK_BUTTON3_MASK))
+    {
+        clear_preview_hover (self, TRUE);
+        return;
+    }
+    GtkWidget *target = gtk_widget_pick (self->stack, x, y, GTK_PICK_DEFAULT);
+    while (target != NULL && !NAUTILUS_IS_VIEW_CELL (target)) target = gtk_widget_get_parent (target);
+    g_autoptr (NautilusViewItem) item = target != NULL ? nautilus_view_cell_get_item (NAUTILUS_VIEW_CELL (target)) : NULL;
+    NautilusFile *file = item != NULL ? nautilus_view_item_get_file (item) : NULL;
+    if (file == self->preview_hover_file) return;
+    /* Keep the current preview while crossing items, so quick motion does not flicker. */
+    if (file == NULL) clear_preview_hover (self, TRUE);
+    else
+    {
+        g_clear_handle_id (&self->preview_hover_timeout, g_source_remove);
+        g_set_object (&self->preview_hover_file, file);
+        self->preview_hover_timeout = g_timeout_add (350, show_hover_preview, self);
+    }
+}
+
+static void
 nautilus_window_slot_set_selection (NautilusWindowSlot *self,
                                     GList              *selection)
 {
+    clear_preview_hover (self, FALSE);
     nautilus_file_list_free (self->selection);
 
     self->selection = selection;
@@ -881,6 +976,17 @@ nautilus_window_slot_constructed (GObject *object)
     G_OBJECT_CLASS (nautilus_window_slot_parent_class)->constructed (object);
 
     self->stack = gtk_stack_new ();
+    GtkEventController *preview_motion = gtk_event_controller_motion_new ();
+    gtk_event_controller_set_propagation_phase (preview_motion, GTK_PHASE_CAPTURE);
+    g_signal_connect (preview_motion, "motion", G_CALLBACK (preview_pointer_motion), self);
+    g_signal_connect (preview_motion, "leave", G_CALLBACK (preview_pointer_leave), self);
+    gtk_widget_add_controller (self->stack, preview_motion);
+    GtkEventController *preview_scroll = gtk_event_controller_scroll_new (GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
+    gtk_event_controller_set_propagation_phase (preview_scroll, GTK_PHASE_CAPTURE);
+    g_signal_connect (preview_scroll, "scroll", G_CALLBACK (preview_pointer_scroll), self);
+    gtk_widget_add_controller (self->stack, preview_scroll);
+    g_signal_connect (self->stack, "unmap", G_CALLBACK (preview_content_unmapped), self);
+    g_signal_connect (self->stack, "map", G_CALLBACK (preview_content_mapped), self);
     GtkWidget *paned = gtk_paned_new (GTK_ORIENTATION_HORIZONTAL);
     gtk_paned_set_start_child (GTK_PANED (paned), self->stack);
     gtk_paned_set_resize_start_child (GTK_PANED (paned), TRUE);
@@ -1258,6 +1364,7 @@ action_preview_pane (GSimpleAction *action, GVariant *parameter, gpointer user_d
 {
     NautilusWindowSlot *self = NAUTILUS_WINDOW_SLOT (user_data);
     if (self->preview_pane == NULL) return;
+    clear_preview_hover (self, FALSE);
     gboolean visible = !gtk_widget_get_visible (GTK_WIDGET (self->preview_pane));
     gtk_widget_set_visible (GTK_WIDGET (self->preview_pane), visible);
     g_simple_action_set_state (action, g_variant_new_boolean (visible));
@@ -1601,6 +1708,7 @@ begin_location_change (NautilusWindowSlot         *self,
                        NautilusLocationChangeType  type,
                        guint                       distance)
 {
+    clear_preview_hover (self, TRUE);
     g_assert (self != NULL);
     g_assert (location != NULL);
     g_assert (type == NAUTILUS_LOCATION_CHANGE_BACK
@@ -2778,6 +2886,7 @@ nautilus_window_slot_dispose (GObject *object)
     NautilusWindowSlot *self;
     self = NAUTILUS_WINDOW_SLOT (object);
 
+    clear_preview_hover (self, FALSE);
     if (self->preview_pane != NULL) nautilus_preview_pane_cancel (self->preview_pane);
     self->preview_pane = NULL;
     g_signal_handlers_disconnect_by_data (nautilus_preferences, self);

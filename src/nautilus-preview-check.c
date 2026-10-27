@@ -1,6 +1,9 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Integration checks exercise the actual widget, loader and Markdown renderer. */
 #include "nautilus-preview-pane.c"
+#undef G_LOG_DOMAIN
+#include "nautilus-window-slot.c"
+#include "nautilus-grid-cell.h"
 #include <glib/gstdio.h>
 #include "nautilus-global-preferences.h"
 #include "nautilus-file-utilities.h"
@@ -158,6 +161,157 @@ check_folder_preview (NautilusPreviewPane *pane, GtkWidget *window, NautilusFile
     nautilus_file_unref (empty);
 }
 
+static void
+check_hover_preview (NautilusFile *first, NautilusFile *second)
+{
+    g_autoptr (NautilusApplication) app = nautilus_application_new ();
+    NautilusWindowSlot *slot = nautilus_window_slot_new (NAUTILUS_MODE_BROWSE);
+    GtkWidget *window = gtk_window_new ();
+    gtk_window_set_default_size (GTK_WINDOW (window), 800, 650);
+    gtk_window_set_child (GTK_WINDOW (window), GTK_WIDGET (slot));
+    GtkWidget *cell = GTK_WIDGET (nautilus_grid_cell_new (NULL));
+    g_object_set (cell, "icon-size", NAUTILUS_GRID_ICON_SIZE_LARGE, NULL);
+    GQuark captions[NAUTILUS_GRID_CELL_N_CAPTIONS] = {0};
+    nautilus_grid_cell_set_caption_attributes (NAUTILUS_GRID_CELL (cell), captions);
+    g_autoptr (NautilusViewItem) item = nautilus_view_item_new (second);
+    nautilus_view_cell_set_item (NAUTILUS_VIEW_CELL (cell), item);
+    gtk_stack_add_named (GTK_STACK (slot->stack), cell, "hover-test");
+    gtk_stack_set_visible_child (GTK_STACK (slot->stack), cell);
+    gtk_window_present (GTK_WINDOW (window));
+    nautilus_window_slot_set_selection (slot, g_list_append (NULL, nautilus_file_ref (first)));
+    pump (500);
+    g_autoptr (GListModel) controllers = gtk_widget_observe_controllers (slot->stack);
+    g_autoptr (GtkEventController) motion = NULL;
+    for (guint i = 0; i < g_list_model_get_n_items (controllers); i++)
+    {
+        g_autoptr (GtkEventController) controller = g_list_model_get_item (controllers, i);
+        if (GTK_IS_EVENT_CONTROLLER_MOTION (controller)) g_set_object (&motion, controller);
+    }
+    g_assert_nonnull (motion);
+    /* Isolate emitted pointer events from the desktop's physical pointer. */
+    gtk_event_controller_set_propagation_phase (motion, GTK_PHASE_NONE);
+    clear_preview_hover (slot, FALSE);
+    nautilus_preview_pane_set_files (slot->preview_pane, slot->selection);
+    double x = gtk_widget_get_width (cell) / 2.0, y = gtk_widget_get_height (cell) / 2.0;
+    g_signal_emit_by_name (motion, "motion", x, y);
+    pump (200);
+    g_autoptr (GFile) initial_location = nautilus_file_get_location (first);
+    g_assert_true (g_file_equal (slot->preview_pane->file, initial_location));
+    pump (500);
+    g_autoptr (GFile) second_location = nautilus_file_get_location (second);
+    g_assert_true (g_file_equal (slot->preview_pane->file, second_location));
+    g_assert_true (slot->selection->data == first);
+    g_assert_null (slot->selection->next);
+    g_print ("PASS hover delay and preview without changing selection\n");
+    g_autoptr (NautilusViewItem) selected_item = nautilus_view_item_new (first);
+    nautilus_view_cell_set_item (NAUTILUS_VIEW_CELL (cell), selected_item);
+    g_signal_emit_by_name (motion, "motion", x, y);
+    pump (550);
+    g_assert_true (g_file_equal (slot->preview_pane->file, initial_location));
+    g_assert_false (slot->preview_hover_active);
+    nautilus_view_cell_set_item (NAUTILUS_VIEW_CELL (cell), item);
+    g_signal_emit_by_name (motion, "motion", x, y);
+    pump (550);
+    g_assert_true (g_file_equal (slot->preview_pane->file, second_location));
+    g_print ("PASS hovering the selected item restores its preview\n");
+    g_signal_emit_by_name (motion, "leave");
+    pump (300);
+    g_autoptr (GFile) first_location = nautilus_file_get_location (first);
+    g_assert_true (g_file_equal (slot->preview_pane->file, first_location));
+    g_signal_emit_by_name (motion, "motion", x, y);
+    g_signal_emit_by_name (motion, "leave");
+    pump (500);
+    g_assert_true (g_file_equal (slot->preview_pane->file, first_location));
+    g_print ("PASS hover leave restores selection and cancels pending preview\n");
+    g_signal_emit_by_name (motion, "motion", x, y);
+    nautilus_window_slot_set_selection (slot, g_list_append (NULL, nautilus_file_ref (second)));
+    pump (500);
+    g_assert_false (slot->preview_hover_active);
+    g_assert_cmpuint (slot->preview_hover_timeout, ==, 0);
+    g_assert_true (slot->selection->data == second);
+    g_signal_emit_by_name (motion, "motion", x, y);
+    GAction *toggle = g_action_map_lookup_action (G_ACTION_MAP (slot->slot_action_group), "preview-pane");
+    action_preview_pane (G_SIMPLE_ACTION (toggle), NULL, slot);
+    pump (500);
+    g_assert_cmpuint (slot->preview_hover_timeout, ==, 0);
+    g_assert_null (slot->preview_pane->media);
+    g_print ("PASS selection and hidden pane cancel pending hover\n");
+    action_preview_pane (G_SIMPLE_ACTION (toggle), NULL, slot);
+    nautilus_view_cell_set_item (NAUTILUS_VIEW_CELL (cell), selected_item);
+    g_signal_emit_by_name (motion, "motion", x, y);
+    g_assert_cmpuint (slot->preview_hover_timeout, !=, 0);
+    g_assert_false (preview_pointer_scroll (NULL, 0, 1, slot));
+    g_assert_cmpuint (slot->preview_hover_timeout, ==, 0);
+    pump (500);
+    g_assert_true (g_file_equal (slot->preview_pane->file, second_location));
+    g_signal_emit_by_name (motion, "motion", x, y);
+    gtk_window_destroy (GTK_WINDOW (window));
+    pump (500);
+    g_print ("PASS scrolling and disposal cancel pending hover\n");
+
+}
+
+static void
+check_video_preview (NautilusPreviewPane *pane, GtkWidget *window, NautilusFile *text_file)
+{
+    g_autofree char *path = g_build_filename (sample_directory, "video.mp4", NULL);
+    NautilusFile *video = ready_file (path);
+    select_file (pane, video);
+    if (g_strcmp0 (gtk_stack_get_visible_child_name (pane->stack), "video") != 0)
+        g_printerr ("Video error: %s\n", gtk_label_get_text (pane->message));
+    g_assert_cmpstr (gtk_stack_get_visible_child_name (pane->stack), ==, "video");
+    g_assert_true (gtk_media_stream_has_video (pane->media));
+    g_assert_true (gtk_media_stream_has_audio (pane->media));
+    g_assert_false (gtk_media_stream_get_playing (pane->media));
+    g_assert_cmpint (gtk_media_stream_get_duration (pane->media), >=, 3 * G_USEC_PER_SEC);
+    g_print ("PASS video prepares with audio, duration and paused playback\n");
+    gtk_media_stream_set_muted (pane->media, TRUE);
+    gtk_media_stream_play (pane->media);
+    for (guint i = 0; i < 5000 && gtk_media_stream_get_timestamp (pane->media) < 300000; i++) pump (1);
+    g_assert_cmpint (gtk_media_stream_get_timestamp (pane->media), >=, 300000);
+    gtk_media_stream_pause (pane->media);
+    g_assert_true (gtk_media_stream_is_seekable (pane->media));
+    gtk_media_stream_seek (pane->media, 2 * G_USEC_PER_SEC);
+    for (guint i = 0; i < 5000 && gtk_media_stream_is_seeking (pane->media); i++) pump (1);
+    g_assert_cmpint (gtk_media_stream_get_timestamp (pane->media), >=, 1500000);
+    set_capture_path ("video-preview.png");
+    pump (400); capture (window);
+    g_print ("PASS video playback, pause and seek\n");
+    g_autoptr (GtkMediaStream) previous = g_object_ref (pane->media);
+    gtk_media_stream_play (previous);
+    select_file (pane, text_file);
+    g_assert_null (pane->media);
+    g_assert_false (gtk_media_stream_get_playing (previous));
+    g_assert_null (gtk_media_file_get_file (GTK_MEDIA_FILE (previous)));
+    g_assert_cmpstr (gtk_stack_get_visible_child_name (pane->stack), ==, "text");
+    GList selection = { .data = video };
+    nautilus_preview_pane_set_files (pane, &selection);
+    nautilus_preview_pane_cancel (pane);
+    pump (300);
+    g_assert_null (pane->media);
+    select_file (pane, video);
+    nautilus_preview_pane_cancel (pane);
+    g_assert_null (pane->media);
+    g_assert_null (gtk_video_get_media_stream (pane->video));
+    g_print ("PASS video cleanup on selection change, hide and pending cancellation\n");
+    g_autofree char *dir = g_dir_make_tmp ("nautilus-video-test-XXXXXX", NULL);
+    g_autofree char *broken = g_build_filename (dir, "broken.mp4", NULL);
+    g_file_set_contents (broken, "not a valid video", -1, NULL);
+    NautilusFile *bad = ready_file (broken);
+    select_file (pane, bad);
+    g_assert_cmpstr (gtk_stack_get_visible_child_name (pane->stack), ==, "message");
+    g_assert_nonnull (strstr (gtk_label_get_text (pane->message), "Video preview unavailable"));
+    select_file (pane, text_file);
+    pump (300);
+    g_assert_cmpstr (gtk_stack_get_visible_child_name (pane->stack), ==, "text");
+    g_print ("PASS corrupt video fallback and recovery\n");
+    nautilus_file_monitor_remove (bad, bad);
+    nautilus_file_unref (bad);
+    nautilus_file_monitor_remove (video, video);
+    nautilus_file_unref (video);
+    g_remove (broken); g_rmdir (dir);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -233,6 +387,18 @@ main (int argc, char **argv)
     NautilusFile *binary_file = ready_file (binary);
     g_autofree char *image_path = g_build_filename (sample_directory, "sample.svg", NULL);
     NautilusFile *image_file = ready_file (image_path);
+    if (argc > 1 && g_str_equal (argv[1], "--hover-only"))
+    {
+        check_hover_preview (txt_file, md_file);
+        NautilusFile *files[] = {md_file, txt_file, large_file, binary_file, image_file};
+        for (guint i = 0; i < G_N_ELEMENTS (files); i++)
+        {
+            nautilus_file_monitor_remove (files[i], files[i]);
+            nautilus_file_unref (files[i]);
+        }
+        remove_preview_directory (dir);
+        return 0;
+    }
     NautilusPreviewPane *pane = NAUTILUS_PREVIEW_PANE (nautilus_preview_pane_new ());
     g_object_ref_sink (pane);
     select_file (pane, md_file);
@@ -285,6 +451,8 @@ main (int argc, char **argv)
     pump (400);
     capture (window);
     check_folder_preview (pane, window, txt_file);
+    check_video_preview (pane, window, txt_file);
+    check_hover_preview (txt_file, md_file);
     const char *document_names[] = {"document.pdf", "document.docx", "sheet.xlsx", "document.odt", "sheet.ods", "sheet.csv", "sheet.tsv"};
     for (guint i = 0; i < G_N_ELEMENTS (document_names); i++)
     {
