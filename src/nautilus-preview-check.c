@@ -42,7 +42,7 @@ pump (guint milliseconds)
 static NautilusFile *
 ready_file (const char *path)
 {
-    g_autoptr (GFile) location = g_file_new_for_path (path);
+    g_autoptr (GFile) location = g_file_new_for_commandline_arg (path);
     NautilusFile *file = nautilus_file_get (location);
     nautilus_file_monitor_add (file, file, NAUTILUS_FILE_ATTRIBUTE_INFO);
     for (guint i = 0; i < 5000 && !nautilus_file_check_if_ready (file, NAUTILUS_FILE_ATTRIBUTE_INFO); i++) pump (1);
@@ -175,6 +175,23 @@ main (int argc, char **argv)
     nautilus_register_resource ();
     nautilus_global_preferences_init ();
     nautilus_ensure_extension_points ();
+    if (argc == 3 && g_str_equal (argv[1], "--folder-uri"))
+    {
+        NautilusPreviewPane *folder_pane = NAUTILUS_PREVIEW_PANE (nautilus_preview_pane_new ());
+        g_object_ref_sink (folder_pane);
+        NautilusFile *folder = ready_file (argv[2]);
+        g_assert_true (nautilus_file_is_directory (folder));
+        select_file (folder_pane, folder);
+        g_assert_true (folder_pane->folder);
+        g_assert_true (g_strcmp0 (gtk_stack_get_visible_child_name (folder_pane->stack), "folder") == 0 ||
+                       g_str_has_prefix (gtk_label_get_text (folder_pane->message), "No visible items"));
+        nautilus_preview_pane_cancel (folder_pane);
+        g_object_unref (folder_pane);
+        nautilus_file_monitor_remove (folder, folder);
+        nautilus_file_unref (folder);
+        g_print ("PASS GIO folder URI preview\n");
+        return 0;
+    }
     if (argc > 1 && g_str_equal (argv[1], "--sheet-only"))
     {
         NautilusPreviewPane *sheet_pane = NAUTILUS_PREVIEW_PANE (nautilus_preview_pane_new ());

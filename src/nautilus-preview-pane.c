@@ -201,7 +201,12 @@ load_folder (PreviewLoad *load, GCancellable *cancel, GError **error)
             load->truncated = TRUE;
             break;
         }
-        if (!load->show_hidden && (g_file_info_get_is_hidden (info) || g_file_info_get_is_backup (info))) continue;
+        const char *name = g_file_info_get_name (info);
+        gboolean hidden = g_file_info_has_attribute (info, G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN)
+                          ? g_file_info_get_is_hidden (info) : g_str_has_prefix (name, ".");
+        gboolean backup = g_file_info_has_attribute (info, G_FILE_ATTRIBUTE_STANDARD_IS_BACKUP)
+                          ? g_file_info_get_is_backup (info) : g_str_has_suffix (name, "~");
+        if (!load->show_hidden && (hidden || backup)) continue;
         if (load->entries->len == FOLDER_LIMIT)
         {
             load->truncated = TRUE;
@@ -418,6 +423,8 @@ preview_loaded (GObject *object, GAsyncResult *result, gpointer data)
         {
             GFileInfo *info = g_ptr_array_index (load->entries, i);
             gboolean directory = g_file_info_get_file_type (info) == G_FILE_TYPE_DIRECTORY;
+            gboolean symlink = g_file_info_has_attribute (info, G_FILE_ATTRIBUTE_STANDARD_IS_SYMLINK) &&
+                               g_file_info_get_is_symlink (info);
             folders += directory;
             GtkWidget *row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 10);
             gtk_widget_set_margin_top (row, 8);
@@ -425,7 +432,7 @@ preview_loaded (GObject *object, GAsyncResult *result, gpointer data)
             gtk_widget_set_margin_start (row, 8);
             gtk_widget_set_margin_end (row, 8);
             GIcon *icon = g_file_info_get_icon (info);
-            GtkWidget *image = g_file_info_get_is_symlink (info) ? gtk_image_new_from_icon_name ("insert-link-symbolic") :
+            GtkWidget *image = symlink ? gtk_image_new_from_icon_name ("insert-link-symbolic") :
                                icon != NULL ? gtk_image_new_from_gicon (icon)
                                            : gtk_image_new_from_icon_name (directory ? "folder-symbolic" : "text-x-generic-symbolic");
             gtk_image_set_pixel_size (GTK_IMAGE (image), 24);
@@ -437,7 +444,7 @@ preview_loaded (GObject *object, GAsyncResult *result, gpointer data)
             gtk_widget_set_tooltip_text (label, g_file_info_get_display_name (info));
             gtk_box_append (GTK_BOX (row), label);
             g_autofree char *detail = directory ? g_strdup ("Folder") :
-                g_file_info_get_is_symlink (info) ? g_strdup ("Link") :
+                symlink ? g_strdup ("Link") :
                 g_file_info_get_file_type (info) == G_FILE_TYPE_REGULAR ? g_format_size (g_file_info_get_size (info)) : g_strdup ("File");
             GtkWidget *size = gtk_label_new (detail);
             gtk_widget_add_css_class (size, "dim-label");
@@ -636,17 +643,17 @@ nautilus_preview_pane_set_files (NautilusPreviewPane *self, GList *files)
     g_autofree char *metadata = g_strdup_printf ("%s · %s", description, size);
     gtk_label_set_text (self->metadata, metadata);
     gtk_widget_set_sensitive (self->open, TRUE);
-    if (!g_file_is_native (self->file))
-    {
-        gtk_label_set_text (self->message, "Open this remote file to view its contents.");
-        return;
-    }
     if (nautilus_file_is_directory (file))
     {
         self->folder = TRUE;
         gtk_label_set_text (self->metadata, "Folder · loading contents…");
         gtk_button_set_label (GTK_BUTTON (self->open), "Open folder");
         queue_preview (self, FALSE);
+        return;
+    }
+    if (!g_file_is_native (self->file))
+    {
+        gtk_label_set_text (self->message, "Open this remote file to view its contents.");
         return;
     }
     gboolean image = mime != NULL && g_str_has_prefix (mime, "image/");

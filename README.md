@@ -91,7 +91,7 @@ Existing system Nautilus extension modules are reused where available. The defau
 
 ## Preview limits
 
-- Local files only; unsupported and remote files offer the normal Open action.
+- File-content previews support local files only; unsupported and remote files offer the normal Open action. Folder listings also support locations available through GIO, including mounted network folders.
 - Folder previews list immediate children only, with up to 500 visible items and 10,000 entries scanned. Limited previews say so; use **Open folder** to browse the full listing. Symlinks inside a folder are listed without following their targets.
 - Text previews stop after 512 KiB. Document and image input files above 100 MiB show a fallback.
 - Spreadsheet previews show up to 5 visible sheets, 200 rows and 30 columns per sheet.
