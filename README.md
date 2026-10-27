@@ -1,6 +1,6 @@
 # Smok Glass Nautilus
 
-A Nautilus file manager with a built-in, read-only preview pane. Select a file or folder once to see it on the right: folder contents, videos, formatted document pages, a spreadsheet grid, images, Markdown, and plain text.
+A Nautilus file manager with a built-in, read-only preview pane. Select a file or folder once to see it on the right: folder contents, ZIP archive listings, videos, formatted document pages, a spreadsheet grid, images, Markdown, and plain text.
 
 Based on **GNOME Nautilus 50.2.2**. This repository contains the complete modified source, local document readers, sample files, and per-user installation tools.
 
@@ -22,6 +22,12 @@ Select a folder to see the first 32 files and subfolders immediately, then scrol
 
 <img src="docs/screenshots/folder-preview.png" alt="A folder preview listing subfolders, files and a shortcut" width="390">
 
+### ZIP preview
+
+Select a local ZIP to see its stored files and folder paths, icons, and uncompressed sizes without extracting it. Entries load in pages of 32 as you scroll, or with **Load more**. Encrypted file entries are labelled when their directory metadata is readable.
+
+<img src="docs/screenshots/zip-preview.png" alt="A ZIP archive listing folders, nested file paths, and sizes in the preview pane" width="390">
+
 ### Video preview
 
 Select a local video to preview it with play/pause, seeking, and volume controls. Playback starts paused and stops when you change selection or hide the pane.
@@ -42,6 +48,7 @@ These are real captures from the native preview widget using the sample files in
 - Single-click and arrow-key selection update the preview. Hover over an item briefly for a temporary preview without changing selection; leaving restores the selection preview. Double-click opens the file normally.
 - Lazy folder previews: 32 items per batch, automatic loading near the bottom, recycled list rows, and a keyboard-accessible Load more button.
 - Folder icons, sizes, hidden-item preference, and empty-folder states.
+- ZIP/ZIP64 archive contents with paged entry lists, nested paths, sizes, and encrypted-entry labels; no extraction.
 - Rendered Markdown with a source toggle; scrollable, selectable plain text.
 - Video playback with native GTK media controls; no autoplay.
 - Image previews through GNOME's sandboxed Glycin loaders.
@@ -52,7 +59,7 @@ These are real captures from the native preview widget using the sample files in
 
 ## Status and requirements
 
-**Experimental desktop software.** Tested locally on **Ubuntu 26.04 / GNOME 50**, GTK 4.22 and libadwaita 1.9. The source requires GTK ≥4.20, libadwaita ≥1.8, GLib ≥2.84, Glycin 2, and the other libraries listed in `meson.build`.
+**Experimental desktop software.** Tested locally on **Ubuntu 26.04 / GNOME 50**, GTK 4.22 and libadwaita 1.9. The source requires libarchive ≥3.6, GTK ≥4.20, libadwaita ≥1.8, GLib ≥2.84, Glycin 2, and the other libraries listed in `meson.build`.
 
 Video previews use GTK’s GStreamer backend and installed codecs (`gstreamer1.0-plugins-good` and `gstreamer1.0-libav` on Ubuntu). Format support depends on those codecs.
 
@@ -112,6 +119,8 @@ Existing system Nautilus extension modules are reused where available. The defau
 - Folder previews read immediate children in pages of up to 32 visible items, scanning at most 256 entries per request when filtering hidden files. Scrolling fetches the next page; there is no longer a 500-item total limit. A hidden-only batch offers **Load more** to continue without scanning the entire folder automatically.
 - Folder counts describe loaded items until the directory ends. Each batch is sorted with folders first; the complete directory is not scanned for a global sort. Symlinks inside a folder are listed without following their targets.
 - Videos stream from local files without the image/document size cap; damaged files or missing codecs show an Open fallback. Playback remains paused until you press Play.
+- ZIP previews support local `.zip`/`.zipx` files with readable ZIP or ZIP64 directories. The central index is limited to 16 MiB / 100,000 entries; libarchive may index that metadata before returning the first page. Other archive formats and remote ZIP files use the normal Open action.
+- Archive rows show stored entry paths across all levels, including hidden entries; implicit parent folders are not synthesized. Listing does not verify passwords, checksums, or member data. Damaged/unsupported directory metadata shows an explanation.
 - Text previews stop after 512 KiB. Document and image input files above 100 MiB show a fallback.
 - Spreadsheet previews show up to 5 visible sheets, 200 rows and 30 columns per sheet.
 - Spreadsheet formulas are not recalculated. Saved results are shown; `—` marks a formula without a saved result. Charts, embedded drawings, conditional formatting, and every Excel number-format variant are not implemented.

@@ -275,6 +275,7 @@ libnautilus_sources = [
 
 nautilus_deps = [
   dependency('libcmark'),
+  dependency('libarchive', version: '>= 3.6'),
   dependency('webkitgtk-6.0'),
   cloudproviders,
   config_h,

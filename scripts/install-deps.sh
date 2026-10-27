@@ -13,6 +13,6 @@ if [[ $(id -u) -ne 0 ]]; then admin=(sudo); fi
   shared-mime-info blueprint-compiler libglib2.0-dev libgtk-4-dev libadwaita-1-dev \
   libglycin-2-dev libglycin-gtk4-2-dev libgnome-autoar-0-dev libgnome-desktop-4-dev \
   libportal-dev libportal-gtk4-dev libtinysparql-dev libicu-dev libselinux1-dev \
-  libwayland-dev libx11-dev libcmark-dev libwebkitgtk-6.0-dev \
+  libwayland-dev libx11-dev libcmark-dev libarchive-dev libwebkitgtk-6.0-dev \
   gstreamer1.0-plugins-good gstreamer1.0-libav \
   python3 python3-openpyxl poppler-utils libreoffice-writer libreoffice-calc bubblewrap

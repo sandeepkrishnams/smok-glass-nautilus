@@ -3,6 +3,10 @@
 #include "nautilus-preview-pane.h"
 #include "nautilus-global-preferences.h"
 #include <adwaita.h>
+#include <archive.h>
+#include <archive_entry.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <cmark.h>
 #include <glycin.h>
 #include <glycin-gtk4.h>
@@ -15,6 +19,15 @@
 #define TEXT_LIMIT (512 * 1024)
 #define FOLDER_PAGE_SIZE 32
 #define FOLDER_SCAN_BATCH 256
+#define ZIP_INDEX_LIMIT (16 * 1024 * 1024)
+#define ZIP_ENTRY_LIMIT 100000
+
+typedef struct
+{
+    struct archive *reader;
+    int fd;
+    guint entries_read;
+} ZipCursor;
 
 struct _NautilusPreviewPane
 {
@@ -41,6 +54,8 @@ struct _NautilusPreviewPane
     GtkWidget *folder_more;
     GtkLabel *folder_status;
     GFileEnumerator *folder_enumerator;
+    ZipCursor *zip_cursor;
+    gboolean zip;
     gboolean folder_loading, folder_done, folder_error;
     guint folder_count;
     gboolean folder_show_hidden;
@@ -74,6 +89,8 @@ typedef struct
     GPtrArray *entries;
     GFileEnumerator *enumerator;
     gboolean exhausted;
+    ZipCursor *zip_cursor;
+    gboolean zip;
 } PreviewLoad;
 
 static gboolean
@@ -118,6 +135,25 @@ release_folder_enumerator (GFileEnumerator **enumerator)
 }
 
 static void
+zip_close_thread (GTask *task, gpointer object, gpointer data, GCancellable *cancel)
+{
+    ZipCursor *cursor = data;
+    if (cursor->reader != NULL) archive_read_free (cursor->reader);
+    if (cursor->fd >= 0) close (cursor->fd);
+    g_free (cursor);
+    g_task_return_boolean (task, TRUE);
+}
+
+static void
+release_zip_cursor (ZipCursor **cursor)
+{
+    if (*cursor == NULL) return;
+    g_autoptr (GTask) task = g_task_new (NULL, NULL, NULL, NULL);
+    g_task_set_task_data (task, g_steal_pointer (cursor), NULL);
+    g_task_run_in_thread (task, zip_close_thread);
+}
+
+static void
 preview_load_free (gpointer data)
 {
     PreviewLoad *load = data;
@@ -127,6 +163,7 @@ preview_load_free (gpointer data)
     g_free (load->document_kind);
     g_clear_pointer (&load->entries, g_ptr_array_unref);
     release_folder_enumerator (&load->enumerator);
+    release_zip_cursor (&load->zip_cursor);
     if (load->temporary_directory != NULL)
     {
         remove_preview_directory (load->temporary_directory);
@@ -236,6 +273,134 @@ load_folder (PreviewLoad *load, GCancellable *cancel, GError **error)
     return TRUE;
 }
 
+static guint64
+zip_uint (const guint8 *bytes, guint size)
+{
+    guint64 value = 0;
+    for (guint i = 0; i < size; i++) value |= (guint64) bytes[i] << (8 * i);
+    return value;
+}
+
+/* The seekable reader indexes the central directory. Bound that index before
+ * handing it to libarchive; member payload sizes are irrelevant to listing. */
+static gboolean
+zip_check_index (int fd, goffset size, gboolean *empty, GError **error)
+{
+    *empty = FALSE;
+    gsize length = MIN (size, 65557);
+    g_autofree guint8 *tail = g_malloc (MAX (length, 1));
+    if (length < 22 || pread (fd, tail, length, size - length) != (ssize_t) length) goto invalid;
+    for (gssize i = length - 22; i >= 0; i--)
+    {
+        if (memcmp (tail + i, "PK\005\006", 4) != 0 || i + 22 + zip_uint (tail + i + 20, 2) != length) continue;
+        guint64 entries = zip_uint (tail + i + 10, 2);
+        guint64 index_size = zip_uint (tail + i + 12, 4);
+        guint64 index_offset = zip_uint (tail + i + 16, 4);
+        if (zip_uint (tail + i + 4, 2) != 0 || zip_uint (tail + i + 6, 2) != 0)
+        {
+            g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "Multi-volume ZIP previews are unavailable. Open the archive in its application.");
+            return FALSE;
+        }
+        if (entries == 0xffff || index_size == 0xffffffff || index_offset == 0xffffffff)
+        {
+            guint8 locator[20], record[56];
+            goffset eocd = size - length + i;
+            if (eocd < 20 || pread (fd, locator, 20, eocd - 20) != 20 || memcmp (locator, "PK\006\007", 4) != 0) goto invalid;
+            guint64 offset = zip_uint (locator + 8, 8);
+            if (size < 56 || offset > (guint64) size - 56 || pread (fd, record, 56, offset) != 56 || memcmp (record, "PK\006\006", 4) != 0) goto invalid;
+            if (zip_uint (locator + 4, 4) != 0 || zip_uint (locator + 16, 4) != 1 ||
+                zip_uint (record + 16, 4) != 0 || zip_uint (record + 20, 4) != 0) goto invalid;
+            entries = zip_uint (record + 32, 8);
+            index_size = zip_uint (record + 40, 8);
+            index_offset = zip_uint (record + 48, 8);
+        }
+        if (entries > ZIP_ENTRY_LIMIT || index_size > ZIP_INDEX_LIMIT)
+        {
+            g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+                "This ZIP index is too large for an inline preview (100,000 entries or 16 MiB). Open the archive in its application.");
+            return FALSE;
+        }
+        if (index_offset > (guint64) size || index_size > (guint64) size - index_offset) goto invalid;
+        *empty = entries == 0 && index_size == 0;
+        return TRUE;
+    }
+invalid:
+    g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA, "ZIP preview unavailable. The archive is damaged, incomplete, or has an unsupported directory.");
+    return FALSE;
+}
+
+static gboolean
+load_zip (PreviewLoad *load, GCancellable *cancel, GError **error)
+{
+    load->entries = g_ptr_array_new_with_free_func (g_object_unref);
+    if (load->zip_cursor == NULL)
+    {
+        load->zip_cursor = g_new0 (ZipCursor, 1);
+        ZipCursor *cursor = load->zip_cursor;
+        g_autofree char *path = g_file_get_path (load->file);
+        cursor->fd = open (path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        struct stat statbuf;
+        if (cursor->fd < 0 || fstat (cursor->fd, &statbuf) != 0 || !S_ISREG (statbuf.st_mode))
+        {
+            g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED, "Cannot read this ZIP file. Open it in its application.");
+            goto failed;
+        }
+        gboolean empty;
+        if (!zip_check_index (cursor->fd, statbuf.st_size, &empty, error)) goto failed;
+        if (empty) { load->exhausted = TRUE; return TRUE; }
+        if (g_cancellable_set_error_if_cancelled (cancel, error)) goto failed;
+        cursor->reader = archive_read_new ();
+        archive_read_support_format_zip_seekable (cursor->reader);
+        if (archive_read_open_fd (cursor->reader, cursor->fd, 65536) != ARCHIVE_OK) goto archive_error;
+    }
+    for (guint i = 0; i < FOLDER_PAGE_SIZE; i++)
+    {
+        if (g_cancellable_set_error_if_cancelled (cancel, error)) goto failed;
+        struct archive_entry *entry;
+        int result = archive_read_next_header (load->zip_cursor->reader, &entry);
+        if (result == ARCHIVE_EOF) { load->exhausted = TRUE; return TRUE; }
+        if ((result != ARCHIVE_OK && result != ARCHIVE_WARN) || entry == NULL) goto archive_error;
+        if (++load->zip_cursor->entries_read > ZIP_ENTRY_LIMIT)
+        {
+            g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "ZIP preview entry limit reached. Open the archive to see more.");
+            goto failed;
+        }
+        const char *path = archive_entry_pathname_utf8 (entry);
+        if (path == NULL) path = archive_entry_pathname (entry);
+        g_autofree char *valid = g_utf8_make_valid (path != NULL ? path : "(unnamed entry)", -1);
+        for (char *c = valid; *c; c++) if ((guchar) *c < 32 || *c == 127) *c = ' ';
+        g_autofree char *short_name = g_utf8_substring (valid, 0, MIN (g_utf8_strlen (valid, -1), 512));
+        g_autofree char *display = g_utf8_strlen (valid, -1) > 512 ? g_strconcat (short_name, "…", NULL) : g_strdup (valid);
+        g_autoptr (GFileInfo) info = g_file_info_new ();
+        gboolean directory = archive_entry_filetype (entry) == AE_IFDIR || g_str_has_suffix (valid, "/");
+        gboolean link = archive_entry_filetype (entry) == AE_IFLNK;
+        g_file_info_set_name (info, valid);
+        g_file_info_set_display_name (info, display);
+        g_file_info_set_file_type (info, directory ? G_FILE_TYPE_DIRECTORY : link ? G_FILE_TYPE_SYMBOLIC_LINK : G_FILE_TYPE_REGULAR);
+        g_file_info_set_is_symlink (info, link);
+        g_autofree char *content_type = directory ? g_strdup ("inode/directory") : g_content_type_guess (valid, NULL, 0, NULL);
+        g_autoptr (GIcon) icon = g_content_type_get_symbolic_icon (content_type);
+        if (icon != NULL) g_file_info_set_icon (info, icon);
+        g_file_info_set_size (info, MAX (0, archive_entry_size (entry)));
+        if (archive_entry_is_encrypted (entry))
+        {
+            g_autofree char *size = g_format_size (MAX (0, archive_entry_size (entry)));
+            g_autofree char *detail = g_strdup_printf ("Encrypted · %s", size);
+            g_file_info_set_attribute_string (info, "smok::entry-detail", detail);
+        }
+        g_ptr_array_add (load->entries, g_steal_pointer (&info));
+        /* No archive_read_data/extract call: the seekable ZIP backend skips
+         * payloads and obtains names/sizes from the bounded central index. */
+    }
+    return TRUE;
+archive_error:
+    g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA, "ZIP preview unavailable: %s",
+                 archive_error_string (load->zip_cursor->reader) != NULL ? archive_error_string (load->zip_cursor->reader) : "Unsupported or damaged archive");
+failed:
+    load->exhausted = TRUE;
+    return FALSE;
+}
+
 /* File I/O and sandboxed image decoding run off the GTK main thread. */
 static void
 preview_load_thread (GTask *task, gpointer object, gpointer data, GCancellable *cancel)
@@ -245,7 +410,7 @@ preview_load_thread (GTask *task, gpointer object, gpointer data, GCancellable *
     if (g_task_return_error_if_cancelled (task)) return;
     if (load->folder)
     {
-        if (!load_folder (load, cancel, &error))
+        if (!(load->zip ? load_zip (load, cancel, &error) : load_folder (load, cancel, &error)))
             g_task_return_error (task, g_steal_pointer (&error));
         else
         {
@@ -433,6 +598,7 @@ folder_row_setup (GtkSignalListItemFactory *factory, GtkListItem *item, gpointer
     GtkWidget *name = gtk_label_new (NULL);
     gtk_label_set_xalign (GTK_LABEL (name), 0);
     gtk_label_set_ellipsize (GTK_LABEL (name), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_label_set_single_line_mode (GTK_LABEL (name), TRUE);
     gtk_widget_set_hexpand (name, TRUE);
     gtk_box_append (GTK_BOX (row), name);
     GtkWidget *detail = gtk_label_new (NULL);
@@ -455,7 +621,7 @@ folder_row_bind (GtkSignalListItemFactory *factory, GtkListItem *item, gpointer 
     gboolean directory = g_file_info_get_file_type (info) == G_FILE_TYPE_DIRECTORY;
     gboolean symlink = g_file_info_has_attribute (info, G_FILE_ATTRIBUTE_STANDARD_IS_SYMLINK) &&
                        g_file_info_get_is_symlink (info);
-    GIcon *icon = g_file_info_get_icon (info);
+    GIcon *icon = g_file_info_has_attribute (info, G_FILE_ATTRIBUTE_STANDARD_ICON) ? g_file_info_get_icon (info) : NULL;
     if (symlink) gtk_image_set_from_icon_name (GTK_IMAGE (image), "insert-link-symbolic");
     else if (icon != NULL) gtk_image_set_from_gicon (GTK_IMAGE (image), icon);
     else gtk_image_set_from_icon_name (GTK_IMAGE (image), directory ? "folder-symbolic" : "text-x-generic-symbolic");
@@ -463,7 +629,8 @@ folder_row_bind (GtkSignalListItemFactory *factory, GtkListItem *item, gpointer 
     gtk_widget_set_tooltip_text (name, g_file_info_get_display_name (info));
     g_autofree char *size = directory ? g_strdup ("Folder") : symlink ? g_strdup ("Link") :
         g_file_info_get_file_type (info) == G_FILE_TYPE_REGULAR ? g_format_size (g_file_info_get_size (info)) : g_strdup ("File");
-    gtk_label_set_text (GTK_LABEL (detail), size);
+    const char *entry_detail = g_file_info_get_attribute_string (info, "smok::entry-detail");
+    gtk_label_set_text (GTK_LABEL (detail), entry_detail != NULL ? entry_detail : size);
 }
 
 static void
@@ -471,6 +638,7 @@ folder_batch_loaded (NautilusPreviewPane *self, PreviewLoad *load, const GError 
 {
     /* The cursor belongs to exactly one worker or the pane, never both. */
     self->folder_enumerator = g_steal_pointer (&load->enumerator);
+    self->zip_cursor = g_steal_pointer (&load->zip_cursor);
     self->folder_done = load->exhausted;
     self->folder_error = error != NULL;
     if (load->entries != NULL && load->entries->len > 0)
@@ -484,7 +652,7 @@ folder_batch_loaded (NautilusPreviewPane *self, PreviewLoad *load, const GError 
     g_autofree char *summary = g_strdup_printf ("%u %s · %u %s%s", self->folder_count,
         self->folder_count == 1 ? "folder" : "folders", count - self->folder_count,
         count - self->folder_count == 1 ? "file" : "files",
-        self->folder_show_hidden ? " · including hidden items" : " · hidden items excluded");
+        self->zip ? " · ZIP archive" : self->folder_show_hidden ? " · including hidden items" : " · hidden items excluded");
     g_autofree char *metadata = self->folder_done ? g_strdup (summary) :
         g_strdup_printf ("%u items loaded · scroll for more\n%s", count, summary);
     gtk_label_set_text (self->metadata, metadata);
@@ -497,11 +665,15 @@ folder_batch_loaded (NautilusPreviewPane *self, PreviewLoad *load, const GError 
     if (count == 0 && (self->folder_done || error != NULL))
     {
         gtk_label_set_text (self->message, error != NULL ? error->message :
-                            self->folder_show_hidden ? "This folder is empty." : "No visible items in this folder.");
+                            self->zip ? "This ZIP archive is empty." : self->folder_show_hidden ? "This folder is empty." : "No visible items in this folder.");
         gtk_stack_set_visible_child_name (self->stack, "message");
     }
     else gtk_stack_set_visible_child_name (self->stack, "folder");
-    if (self->folder_done) release_folder_enumerator (&self->folder_enumerator);
+    if (self->folder_done)
+    {
+        release_folder_enumerator (&self->folder_enumerator);
+        release_zip_cursor (&self->zip_cursor);
+    }
     /* Appending can synchronously change adjustments: do not start a second
      * worker until the complete batch has been applied. */
     self->folder_loading = FALSE;
@@ -645,6 +817,7 @@ nautilus_preview_pane_cancel (NautilusPreviewPane *self)
 {
     self->serial++;
     release_folder_enumerator (&self->folder_enumerator);
+    release_zip_cursor (&self->zip_cursor);
     self->folder_loading = FALSE;
     self->folder_done = TRUE;
     if (self->media != NULL)
@@ -702,6 +875,7 @@ queue_preview (NautilusPreviewPane *self, gboolean image)
     load->document_kind = g_strdup (self->document_kind);
     load->page = self->page;
     load->folder = self->folder;
+    load->zip = self->zip;
     load->show_hidden = self->folder_show_hidden;
     if (self->folder)
     {
@@ -728,8 +902,10 @@ request_folder_page (NautilusPreviewPane *self)
     load->file = g_object_ref (self->file);
     load->serial = self->serial;
     load->folder = TRUE;
+    load->zip = self->zip;
     load->show_hidden = self->folder_show_hidden;
     load->enumerator = g_steal_pointer (&self->folder_enumerator);
+    load->zip_cursor = g_steal_pointer (&self->zip_cursor);
     g_autoptr (GTask) task = g_task_new (self, self->cancellable, preview_loaded, NULL);
     g_task_set_task_data (task, load, preview_load_free);
     g_task_run_in_thread (task, preview_load_thread);
@@ -763,7 +939,7 @@ change_pdf_page (NautilusPreviewPane *self, int delta)
 static void
 folder_visibility_changed (GSettings *settings, const char *key, NautilusPreviewPane *self)
 {
-    if (!self->folder || self->file == NULL || !gtk_widget_get_visible (GTK_WIDGET (self))) return;
+    if (!self->folder || self->zip || self->file == NULL || !gtk_widget_get_visible (GTK_WIDGET (self))) return;
     nautilus_preview_pane_cancel (self);
     reset_folder_preview (self);
     queue_preview (self, FALSE);
@@ -810,6 +986,7 @@ nautilus_preview_pane_set_files (NautilusPreviewPane *self, GList *files)
     gtk_widget_set_visible (self->page_controls, FALSE);
     self->document_kind = NULL;
     self->folder = FALSE;
+    self->zip = FALSE;
     gtk_button_set_label (GTK_BUTTON (self->open), "Open in application");
     self->page = 1;
     self->total_pages = 0;
@@ -847,6 +1024,19 @@ nautilus_preview_pane_set_files (NautilusPreviewPane *self, GList *files)
     if (!g_file_is_native (self->file))
     {
         gtk_label_set_text (self->message, "Open this remote file to view its contents.");
+        return;
+    }
+    g_autofree char *archive_name = g_ascii_strdown (name, -1);
+    gboolean zipped_document = g_str_has_suffix (archive_name, ".docx") || g_str_has_suffix (archive_name, ".xlsx") ||
+                               g_str_has_suffix (archive_name, ".odt") || g_str_has_suffix (archive_name, ".ods");
+    if (g_str_has_suffix (archive_name, ".zip") || g_str_has_suffix (archive_name, ".zipx") ||
+        (!zipped_document && (g_strcmp0 (mime, "application/zip") == 0 || g_strcmp0 (mime, "application/x-zip-compressed") == 0)))
+    {
+        self->folder = TRUE;
+        self->zip = TRUE;
+        gtk_button_set_label (GTK_BUTTON (self->open), "Open archive");
+        gtk_label_set_text (self->metadata, "ZIP archive · reading contents…");
+        queue_preview (self, FALSE);
         return;
     }
     if (mime != NULL && g_str_has_prefix (mime, "video/"))

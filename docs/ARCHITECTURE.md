@@ -8,6 +8,7 @@
 | --- | --- |
 | Folders | Cursor-based GIO enumeration in bounded worker batches → GListStore → virtualized GtkListView |
 | Text/Markdown | Bounded file reads, GtkTextView, local CommonMark rendering |
+| Local ZIP archives | Bounded ZIP/ZIP64 index check → libarchive seekable reader → paged, virtualized entry list |
 | Local videos | Debounced GtkMediaFile → GtkVideo with GStreamer playback controls |
 | Images | Glycin sandboxed decode, GtkPicture |
 | PDF | Poppler page rasterization, Glycin texture loading |
@@ -33,3 +34,5 @@ Hidden/backup entries follow the GTK file chooser preference; changing it cancel
 Video streams load paused after the selection debounce. Prepared/error notifications update only the current stream; cancellation disconnects notifications, pauses, detaches, clears, and releases it. Videos are decoded by the installed GTK media backend, not Glycin or the office sandbox. They are local-only and do not use the image/document size cap.
 
 A capture-phase pointer motion controller on the slot’s content stack resolves grid/list cells without changing selection. A 350 ms dwell precedes the existing 120 ms loader debounce. Crossing items replaces pending hover work; leaving restores the selection. Selection, navigation, hiding, and disposal clear hover state. Pointer motion with pressed mouse buttons does not initiate previews.
+
+ZIP previews reuse the folder list/model and paging controls with a separate libarchive cursor. The worker opens only regular local files, validates the end-of-directory record (including ZIP64), and rejects central indices above 16 MiB or more than 100,000 declared entries before libarchive indexing. The reader also enforces the entry limit while paging. Libarchive’s seekable ZIP reader can index the central metadata up front; row creation and entry presentation remain lazy. No archive extraction or regular-member data reads are requested. Link metadata may be read by libarchive. Stored entry paths are plain display strings, never filesystem destinations; controls and long display names are bounded. Encrypted entry data can still have readable names/sizes; inaccessible metadata falls back with an error, without a password dialog. The cursor is transferred between exactly one worker and the pane; cancellation/stale-result rules match folders, and cleanup closes the reader/file descriptor off the GTK thread. See [libarchive](https://www.libarchive.org/) for the underlying parser.
