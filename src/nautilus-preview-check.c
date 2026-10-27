@@ -4,6 +4,7 @@
 #undef G_LOG_DOMAIN
 #include "nautilus-window-slot.c"
 #include "nautilus-grid-cell.h"
+#include "nautilus-view-model.h"
 #include <glib/gstdio.h>
 #include "nautilus-global-preferences.h"
 #include "nautilus-file-utilities.h"
@@ -103,6 +104,219 @@ wait_for_folder_page (NautilusPreviewPane *pane)
         g_usleep (1000);
     }
     g_assert_false (pane->folder_loading);
+}
+
+static void
+wait_for_overview (NautilusPreviewPane *pane)
+{
+    gint64 deadline = g_get_monotonic_time () + 10 * G_USEC_PER_SEC;
+    while ((pane->overview_source != 0 || pane->overview_task != NULL) &&
+           g_get_monotonic_time () < deadline) pump (1);
+    g_assert_cmpuint (pane->overview_source, ==, 0);
+    g_assert_null (pane->overview_task);
+    g_assert_false (pane->usage_result.running);
+}
+
+static void
+usage_test_file (const char *directory, const char *name, goffset bytes)
+{
+    g_autofree char *path = g_build_filename (directory, name, NULL);
+    int fd = g_open (path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    g_assert_cmpint (fd, >=, 0);
+    g_assert_cmpint (ftruncate (fd, bytes), ==, 0);
+    close (fd);
+}
+
+static guint64
+usage_segment_bytes (NautilusUsageResult *result, const char *name)
+{
+    for (guint i = 0; i < result->n_segments; i++)
+        if (g_str_equal (result->segments[i].name, name)) return result->segments[i].bytes;
+    g_error ("Missing usage segment %s", name);
+}
+
+static void
+check_overview (NautilusPreviewPane *pane, GtkWidget *window, NautilusFile *text_file)
+{
+    g_autofree char *temp = g_dir_make_tmp ("smok-folder-usage-XXXXXX", NULL);
+    g_autofree char *root = g_build_filename (temp, "Usage demo", NULL);
+    g_autofree char *outside = g_build_filename (temp, "Outside", NULL);
+    g_mkdir (root, 0700); g_mkdir (outside, 0700);
+    usage_test_file (outside, "not-included", 100000000);
+    const char *names[] = { "Photos/Originals", "Videos", "Documents", "Archive", "Empty" };
+    const goffset sizes[] = { 6000000, 3000000, 1000000, 500000, 0 };
+    for (guint i = 0; i < G_N_ELEMENTS (names); i++)
+    {
+        g_autofree char *child = g_build_filename (root, names[i], NULL);
+        g_mkdir_with_parents (child, 0700);
+        if (sizes[i] > 0) usage_test_file (child, "sample", sizes[i]);
+    }
+    usage_test_file (root, "notes.txt", 250000);
+    usage_test_file (root, ".hidden", 50000);
+    g_autofree char *link = g_build_filename (root, "External link", NULL);
+    g_assert_cmpint (symlink (outside, link), ==, 0);
+    g_autofree char *fifo = g_build_filename (root, "Pipe", NULL);
+    g_assert_cmpint (mkfifo (fifo, 0600), ==, 0);
+    g_autoptr (GFile) location = g_file_new_for_path (root);
+    nautilus_preview_pane_set_context (pane, location, NULL, TRUE);
+    nautilus_preview_pane_set_files (pane, NULL);
+    g_assert_null (pane->overview_task);
+    g_assert_cmpuint (pane->overview_source, ==, 0);
+    g_assert_nonnull (strstr (gtk_label_get_text (pane->storage_label), "Waiting"));
+    nautilus_preview_pane_set_context (pane, location, NULL, FALSE);
+    nautilus_preview_pane_set_files (pane, NULL);
+    g_assert_null (pane->overview_task);
+    g_assert_cmpuint (pane->overview_source, !=, 0);
+    wait_for_overview (pane);
+    g_assert_true (pane->overview_active);
+    g_assert_cmpstr (gtk_stack_get_visible_child_name (pane->stack), ==, "overview");
+    g_assert_cmpuint (pane->usage_result.bytes, ==, 10800000);
+    g_assert_cmpuint (pane->usage_result.files, ==, 8);
+    g_assert_cmpuint (pane->usage_result.folders, ==, 6);
+    g_assert_cmpuint (usage_segment_bytes (&pane->usage_result, "Photos/"), ==, 6000000);
+    g_assert_cmpuint (usage_segment_bytes (&pane->usage_result, "Loose files"), ==, 300000);
+    g_assert_false (pane->usage_result.partial);
+    g_assert_false (gtk_widget_get_visible (pane->open));
+    g_print ("PASS folder usage recursive sizes, nested counts, hidden files and loose-file grouping\n");
+    g_print ("PASS usage avoids symlink traversal, special-file reads and sparse-file payloads\n");
+    set_capture_path ("folder-overview.png");
+    pump (300); capture (window);
+    g_print ("PASS folder usage multicolour donut and matching size/percentage legend\n");
+    gint64 checked = pane->usage_checked;
+    select_file (pane, text_file);
+    g_assert_false (pane->overview_active);
+    g_assert_true (gtk_widget_get_visible (pane->open));
+    nautilus_preview_pane_set_files (pane, NULL);
+    wait_for_overview (pane);
+    g_assert_cmpint (pane->usage_checked, ==, checked);
+    g_print ("PASS usage restores after selection with cached folder totals\n");
+    overview_refresh_clicked (NULL, pane);
+    g_assert_nonnull (pane->overview_task);
+    overview_refresh_clicked (NULL, pane);
+    g_assert_null (pane->overview_task);
+    g_assert_true (pane->usage_result.cancelled);
+    pump (200);
+    g_assert_true (pane->usage_result.cancelled);
+    overview_refresh_clicked (NULL, pane);
+    wait_for_overview (pane);
+    g_assert_cmpuint (pane->usage_result.bytes, ==, 10800000);
+    g_print ("PASS usage Stop/Rescan controls and rejection of cancelled worker results\n");
+
+    /* Top-six aggregation must conserve bytes for any number of root folders. */
+    for (guint i = 0; i < 20; i++)
+    {
+        g_autofree char *name = g_strdup_printf ("Tiny-%02u", i);
+        g_autofree char *child = g_build_filename (root, name, NULL);
+        g_mkdir (child, 0700);
+        usage_test_file (child, "small", 10);
+    }
+    overview_refresh_clicked (NULL, pane);
+    wait_for_overview (pane);
+    g_assert_cmpuint (pane->usage_result.n_segments, ==, 8);
+    g_assert_cmpuint (pane->usage_result.bytes, ==, 10800200);
+    g_assert_cmpuint (usage_segment_bytes (&pane->usage_result, "Other folders"), ==, 180);
+    guint64 sum = 0;
+    for (guint i = 0; i < pane->usage_result.n_segments; i++) sum += pane->usage_result.segments[i].bytes;
+    g_assert_cmpuint (sum, ==, pane->usage_result.bytes);
+    g_print ("PASS bounded top-six aggregation conserves bytes with Other folders\n");
+
+    g_autofree char *empty = g_build_filename (root, "Empty", NULL);
+    g_autoptr (GFile) empty_location = g_file_new_for_path (empty);
+    nautilus_preview_pane_set_context (pane, empty_location, NULL, FALSE);
+    nautilus_preview_pane_set_files (pane, NULL);
+    wait_for_overview (pane);
+    g_assert_cmpstr (gtk_label_get_text (pane->storage_label), ==, "This folder is empty.");
+    g_assert_cmpuint (pane->usage_result.bytes, ==, 0);
+    g_print ("PASS usage empty folder state without invalid percentages\n");
+    g_autoptr (GFile) missing = g_file_new_for_path ("/nonexistent-smok-overview-location");
+    nautilus_preview_pane_set_context (pane, missing, NULL, FALSE);
+    nautilus_preview_pane_set_files (pane, NULL);
+    wait_for_overview (pane);
+    g_assert_true (pane->usage_result.unreadable);
+    g_assert_true (pane->usage_result.partial);
+    g_print ("PASS usage unreadable folder reports partial totals\n");
+    g_autoptr (GFile) network = g_file_new_for_uri ("smb://smok-preview.invalid/share");
+    nautilus_preview_pane_set_context (pane, network, NULL, FALSE);
+    nautilus_preview_pane_set_files (pane, NULL);
+    g_assert_null (pane->overview_task);
+    g_assert_cmpuint (pane->overview_source, ==, 0);
+    g_assert_cmpstr (gtk_button_get_label (GTK_BUTTON (pane->overview_refresh)), ==, "Calculate folder usage");
+    g_print ("PASS network folder usage requires an explicit scan\n");
+    nautilus_preview_pane_set_context (pane, location, NULL, FALSE);
+    nautilus_preview_pane_set_files (pane, NULL);
+    select_file (pane, text_file);
+    pump (500);
+    g_assert_false (pane->overview_active);
+    g_assert_cmpuint (pane->overview_source, ==, 0);
+    g_assert_null (pane->overview_task);
+    g_assert_cmpstr (gtk_stack_get_visible_child_name (pane->stack), ==, "text");
+    nautilus_preview_pane_set_context (pane, NULL, NULL, FALSE);
+    nautilus_preview_pane_set_files (pane, NULL);
+    g_assert_cmpstr (gtk_stack_get_visible_child_name (pane->stack), ==, "message");
+    g_print ("PASS usage pending-scan cancellation and virtual view fallback\n");
+
+    g_autofree char *deep = g_build_filename (temp, "Deep", NULL);
+    g_autofree char *deep_child = g_strdup (deep);
+    for (guint i = 0; i < 70; i++)
+    {
+        g_mkdir (deep_child, 0700);
+        char *next = g_build_filename (deep_child, "d", NULL);
+        g_free (deep_child); deep_child = next;
+    }
+    g_autoptr (GFile) deep_location = g_file_new_for_path (deep);
+    NautilusFolderUsage *usage = nautilus_folder_usage_new (deep_location);
+    g_autoptr (GCancellable) cancel = g_cancellable_new ();
+    nautilus_folder_usage_scan (usage, cancel);
+    NautilusUsageResult result;
+    nautilus_folder_usage_snapshot (usage, &result);
+    g_assert_true (result.limited);
+    g_assert_true (result.partial);
+    g_assert_cmpuint (result.folders, ==, 64);
+    nautilus_folder_usage_free (usage);
+    usage = nautilus_folder_usage_new (location);
+    g_cancellable_cancel (cancel);
+    nautilus_folder_usage_scan (usage, cancel);
+    nautilus_folder_usage_snapshot (usage, &result);
+    g_assert_true (result.cancelled);
+    g_assert_cmpuint (result.files, ==, 0);
+    nautilus_folder_usage_free (usage);
+    g_print ("PASS usage depth safety limit and already-cancelled scan\n");
+    /* Exercise actual slot navigation, not just the standalone widget API. */
+    NautilusWindowSlot *slot = nautilus_window_slot_new (NAUTILUS_MODE_BROWSE);
+    GtkWidget *slot_window = gtk_window_new ();
+    gtk_window_set_default_size (GTK_WINDOW (slot_window), 1000, 700);
+    gtk_window_set_child (GTK_WINDOW (slot_window), GTK_WIDGET (slot));
+    gtk_window_present (GTK_WINDOW (slot_window));
+    nautilus_window_slot_open_location_full (slot, location, NULL);
+    gint64 deadline = g_get_monotonic_time () + 15 * G_USEC_PER_SEC;
+    while ((slot->content_view == NULL || nautilus_files_view_is_loading (slot->content_view) ||
+            !slot->preview_pane->overview_active) && g_get_monotonic_time () < deadline) pump (1);
+    nautilus_window_slot_set_selection (slot, NULL);
+    wait_for_overview (slot->preview_pane);
+    g_assert_true (slot->preview_pane->overview_active);
+    g_assert_cmpuint (slot->preview_pane->usage_result.bytes, ==, 10800200);
+    slot->preview_hover_file = nautilus_file_ref (text_file);
+    show_hover_preview (slot);
+    g_assert_true (slot->preview_hover_active);
+    g_assert_null (slot->selection);
+    clear_preview_hover (slot, TRUE);
+    wait_for_overview (slot->preview_pane);
+    g_assert_true (slot->preview_pane->overview_active);
+    g_assert_cmpuint (slot->preview_pane->usage_result.bytes, ==, 10800200);
+    nautilus_window_slot_open_location_full (slot, empty_location, NULL);
+    deadline = g_get_monotonic_time () + 15 * G_USEC_PER_SEC;
+    while ((nautilus_files_view_is_loading (slot->content_view) ||
+            slot->preview_pane->overview_location == NULL ||
+            !g_file_equal (slot->preview_pane->overview_location, empty_location)) &&
+           g_get_monotonic_time () < deadline) pump (1);
+    nautilus_window_slot_set_selection (slot, NULL);
+    wait_for_overview (slot->preview_pane);
+    g_assert_cmpuint (slot->preview_pane->usage_result.files, ==, 0);
+    g_assert_cmpuint (slot->preview_pane->usage_result.folders, ==, 0);
+    gtk_window_destroy (GTK_WINDOW (slot_window));
+    pump (150);
+    g_print ("PASS real slot folder navigation, unselected overview and hover restoration\n");
+    remove_preview_directory (temp);
 }
 
 static void
@@ -411,7 +625,6 @@ emit_cell_hover (NautilusWindowSlot *slot, GtkEventController *motion, GtkWidget
 static void
 check_hover_preview (NautilusFile *first, NautilusFile *second)
 {
-    g_autoptr (NautilusApplication) app = nautilus_application_new ();
     NautilusWindowSlot *slot = nautilus_window_slot_new (NAUTILUS_MODE_BROWSE);
     GtkWidget *window = gtk_window_new ();
     gtk_window_set_default_size (GTK_WINDOW (window), 800, 650);
@@ -577,6 +790,9 @@ main (int argc, char **argv)
     nautilus_register_resource ();
     nautilus_global_preferences_init ();
     nautilus_ensure_extension_points ();
+    /* Views can finish async action updates after their windows close. Keep
+     * the app and its DBus launcher alive for the entire integration run. */
+    g_autoptr (NautilusApplication) app = nautilus_application_new ();
     if (argc == 3 && g_str_equal (argv[1], "--folder-uri"))
     {
         NautilusPreviewPane *folder_pane = NAUTILUS_PREVIEW_PANE (nautilus_preview_pane_new ());
@@ -712,6 +928,8 @@ main (int argc, char **argv)
         check_zip_preview (pane, window, txt_file);
         goto preview_check_cleanup;
     }
+    check_overview (pane, window, txt_file);
+    if (argc > 1 && g_str_equal (argv[1], "--overview-only")) goto preview_check_cleanup;
     check_folder_preview (pane, window, txt_file);
     if (argc > 1 && g_str_equal (argv[1], "--folder-only")) goto preview_check_cleanup;
     check_zip_preview (pane, window, txt_file);

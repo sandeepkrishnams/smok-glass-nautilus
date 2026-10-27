@@ -265,6 +265,8 @@ libnautilus_sources = [
   'nautilus-view-model.h',
   'nautilus-window.c',
   'nautilus-window.h',
+  'nautilus-folder-usage.c',
+  'nautilus-folder-usage.h',
   'nautilus-preview-pane.c',
   'nautilus-preview-pane.h',
   'nautilus-window-slot.c',

@@ -639,6 +639,24 @@ nautilus_window_slot_add_extra_location_widget (NautilusWindowSlot *self,
 }
 
 static void
+preview_selected (NautilusWindowSlot *self)
+{
+    GFile *location = self->content_view != NULL ? nautilus_files_view_get_location (self->content_view) : NULL;
+    GListModel *model = self->content_view != NULL ?
+        G_LIST_MODEL (nautilus_files_view_get_private_model (self->content_view)) : NULL;
+    /* Search, Recent and other virtual views are not a single folder. */
+    if (location != NULL && !(g_file_has_uri_scheme (location, "file") ||
+                             g_file_has_uri_scheme (location, "smb") ||
+                             g_file_has_uri_scheme (location, "sftp") ||
+                             g_file_has_uri_scheme (location, "ftp") ||
+                             g_file_has_uri_scheme (location, "dav") ||
+                             g_file_has_uri_scheme (location, "davs"))) location = NULL;
+    nautilus_preview_pane_set_context (self->preview_pane, location, location != NULL ? model : NULL,
+        self->content_view != NULL && nautilus_files_view_is_loading (self->content_view));
+    nautilus_preview_pane_set_files (self->preview_pane, self->selection);
+}
+
+static void
 clear_preview_hover (NautilusWindowSlot *self, gboolean restore)
 {
     g_clear_handle_id (&self->preview_hover_timeout, g_source_remove);
@@ -647,7 +665,7 @@ clear_preview_hover (NautilusWindowSlot *self, gboolean restore)
     self->preview_hover_active = FALSE;
     if (restore && active && self->preview_pane != NULL &&
         gtk_widget_get_visible (GTK_WIDGET (self->preview_pane)))
-        nautilus_preview_pane_set_files (self->preview_pane, self->selection);
+        preview_selected (self);
 }
 
 static gboolean
@@ -662,7 +680,7 @@ show_hover_preview (gpointer data)
             self->selection->data == self->preview_hover_file)
         {
             if (self->preview_hover_active)
-                nautilus_preview_pane_set_files (self->preview_pane, self->selection);
+                preview_selected (self);
             self->preview_hover_active = FALSE;
             return G_SOURCE_REMOVE;
         }
@@ -698,7 +716,7 @@ static void
 preview_content_mapped (GtkWidget *widget, NautilusWindowSlot *self)
 {
     if (self->preview_pane != NULL && gtk_widget_get_visible (GTK_WIDGET (self->preview_pane)))
-        nautilus_preview_pane_set_files (self->preview_pane, self->selection);
+        preview_selected (self);
 }
 
 static void
@@ -737,7 +755,7 @@ nautilus_window_slot_set_selection (NautilusWindowSlot *self,
     self->selection = selection;
     if (self->preview_pane != NULL && gtk_widget_get_visible (GTK_WIDGET (self->preview_pane)))
     {
-        nautilus_preview_pane_set_files (self->preview_pane, selection);
+        preview_selected (self);
     }
     g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_SELECTION]);
 }
@@ -1369,7 +1387,7 @@ action_preview_pane (GSimpleAction *action, GVariant *parameter, gpointer user_d
     gtk_widget_set_visible (GTK_WIDGET (self->preview_pane), visible);
     g_simple_action_set_state (action, g_variant_new_boolean (visible));
     g_settings_set_boolean (nautilus_preferences, "preview-pane-visible", visible);
-    if (visible) nautilus_preview_pane_set_files (self->preview_pane, self->selection);
+    if (visible) preview_selected (self);
     else nautilus_preview_pane_cancel (self->preview_pane);
 }
 
@@ -2772,6 +2790,8 @@ view_started_loading (NautilusWindowSlot *self,
     }
 
     nautilus_window_slot_set_loading (self, TRUE);
+    if (self->preview_pane != NULL && gtk_widget_get_visible (GTK_WIDGET (self->preview_pane)))
+        preview_selected (self);
 }
 
 static void
@@ -2792,6 +2812,8 @@ view_ended_loading (NautilusWindowSlot *self,
     nautilus_window_slot_set_allow_stop (self, FALSE);
 
     nautilus_window_slot_set_loading (self, FALSE);
+    if (self->preview_pane != NULL && gtk_widget_get_visible (GTK_WIDGET (self->preview_pane)))
+        preview_selected (self);
 }
 
 static void

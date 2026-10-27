@@ -10,6 +10,16 @@ Smoked-glass styling with an embedded Markdown preview.
 
 ## See it
 
+### Folder usage overview
+
+Clear the selection to see how much space the current folder’s contents use. A coloured donut shows the six largest subfolders, **Other folders**, and **Loose files**, with each group’s size and percentage. The centre shows the total file size; the summary counts all nested files and folders, including hidden items.
+
+The metadata scan runs on a background worker after a short delay, with live progress, **Stop scan**, and **Rescan folder**. Selecting or hovering over an item shows its preview; clearing selection or leaving a hover restores the overview. Completed results are cached for 30 seconds when returning to the same folder. Network folders offer **Calculate folder usage** instead of scanning automatically. Virtual views such as Recent and Search keep the selection prompt.
+
+Sizes are logical file sizes, not allocated disk blocks. Child symlinks are counted without traversing their targets, and links/special files add no size. Hard-linked files count once per listed path. Unreadable paths and limits (200,000 items, 64 directory levels, or 30 seconds checked between operations) produce clearly labelled partial totals. The scan keeps only bounded aggregates and directory cursors, rather than a list of every descendant.
+
+<img src="docs/screenshots/folder-overview.png" alt="Folder usage donut showing subfolder sizes, percentages, loose files, and total item counts" width="390">
+
 ### Spreadsheet preview
 
 Column letters, row numbers, worksheet tabs, merged cells, colours, borders, and common number formats—all inside the preview pane.
@@ -44,6 +54,7 @@ These are real captures from the native preview widget using the sample files in
 
 ## Features
 
+- Folder usage when nothing is selected: coloured subfolder-size donut, loose-file grouping, recursive item counts, background progress, and Stop/Rescan controls.
 - Embedded, resizable right preview pane; **Ctrl+Shift+P** toggles it.
 - Single-click and arrow-key selection update the preview. Hover over an item briefly for a temporary preview without changing selection; leaving restores the selection preview. Double-click opens the file normally.
 - Lazy folder previews: 32 items per batch, automatic loading near the bottom, recycled list rows, and a keyboard-accessible Load more button.

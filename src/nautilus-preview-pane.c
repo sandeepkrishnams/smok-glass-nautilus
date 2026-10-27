@@ -2,6 +2,7 @@
 #include "config.h"
 #include "nautilus-preview-pane.h"
 #include "nautilus-global-preferences.h"
+#include "nautilus-folder-usage.h"
 #include <adwaita.h>
 #include <archive.h>
 #include <archive_entry.h>
@@ -35,6 +36,18 @@ struct _NautilusPreviewPane
     GtkLabel *name;
     GtkLabel *metadata;
     GtkLabel *message;
+    GtkDrawingArea *storage_chart;
+    GtkLabel *storage_label, *storage_percent, *overview_counts;
+    GtkWidget *overview_rows[NAUTILUS_USAGE_SEGMENTS], *overview_refresh;
+    GtkLabel *overview_names[NAUTILUS_USAGE_SEGMENTS], *overview_values[NAUTILUS_USAGE_SEGMENTS];
+    GFile *overview_location;
+    GListModel *overview_model;
+    gulong overview_changed;
+    guint overview_source;
+    gboolean overview_active, overview_loading;
+    GTask *overview_task;
+    NautilusUsageResult usage_result;
+    gint64 usage_checked;
     GtkStack *stack;
     GtkPicture *picture;
     GtkVideo *video;
@@ -92,6 +105,207 @@ typedef struct
     ZipCursor *zip_cursor;
     gboolean zip;
 } PreviewLoad;
+
+/* Folder usage is scanned on one worker, with fixed-size progress snapshots. */
+static const char *usage_colors[NAUTILUS_USAGE_SEGMENTS] = {
+    "#70a5ed", "#a88beb", "#71c6a0", "#efb568", "#e889a5", "#70c4d4", "#9ca3b5", "#d4c26a"
+};
+static void show_overview (NautilusPreviewPane *self);
+
+static void
+overview_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer data)
+{
+    NautilusPreviewPane *self = data;
+    double radius = MIN (width, height) * 0.36;
+    GdkRGBA foreground;
+    gtk_widget_get_color (GTK_WIDGET (area), &foreground);
+    cairo_set_line_width (cr, 18);
+    cairo_set_source_rgba (cr, foreground.red, foreground.green, foreground.blue, 0.15);
+    cairo_arc (cr, width / 2.0, height / 2.0, radius, 0, 2 * G_PI);
+    cairo_stroke (cr);
+    double start = -G_PI / 2;
+    NautilusUsageResult *result = &self->usage_result;
+    for (guint i = 0; result->bytes > 0 && i < result->n_segments; i++)
+    {
+        if (result->segments[i].bytes == 0) continue;
+        double end = start + 2 * G_PI * ((double) result->segments[i].bytes / result->bytes);
+        GdkRGBA color;
+        gdk_rgba_parse (&color, usage_colors[i]);
+        gdk_cairo_set_source_rgba (cr, &color);
+        cairo_arc (cr, width / 2.0, height / 2.0, radius, start, end);
+        cairo_stroke (cr);
+        start = end;
+    }
+}
+
+static void
+overview_render (NautilusPreviewPane *self)
+{
+    NautilusUsageResult *result = &self->usage_result;
+    g_autofree char *size = g_format_size (result->bytes);
+    gtk_label_set_text (self->storage_percent, size);
+    gtk_label_set_text (self->storage_label,
+        result->unreadable ? "Unable to read this folder." :
+        result->running ? "Scanning… sizes and shares so far" :
+        result->cancelled ? "Scan stopped — totals are partial." :
+        result->partial ? "Partial totals — some paths were unreadable or a scan limit was reached." :
+        result->files + result->folders == 0 ? "This folder is empty." : "Total file sizes in this folder");
+    guint64 items = result->files + result->folders;
+    g_autofree char *counts = g_strdup_printf ("%" G_GUINT64_FORMAT " items · %" G_GUINT64_FORMAT
+        " files · %" G_GUINT64_FORMAT " folders", items, result->files, result->folders);
+    gtk_label_set_text (self->overview_counts, counts);
+    for (guint i = 0; i < NAUTILUS_USAGE_SEGMENTS; i++)
+    {
+        gtk_widget_set_visible (self->overview_rows[i], i < result->n_segments);
+        if (i >= result->n_segments) continue;
+        NautilusUsageSegment *segment = &result->segments[i];
+        gtk_label_set_text (self->overview_names[i], segment->name);
+        gtk_widget_set_tooltip_text (GTK_WIDGET (self->overview_names[i]), segment->name);
+        g_autofree char *part_size = g_format_size (segment->bytes);
+        g_autofree char *value = g_strdup_printf ("%s · %.1f%%", part_size,
+            result->bytes > 0 ? 100.0 * segment->bytes / result->bytes : 0.0);
+        gtk_label_set_text (self->overview_values[i], value);
+    }
+    gtk_button_set_label (GTK_BUTTON (self->overview_refresh), result->running ? "Stop scan" : "Rescan folder");
+    gtk_widget_queue_draw (GTK_WIDGET (self->storage_chart));
+}
+
+static gboolean
+overview_progress (gpointer data)
+{
+    NautilusPreviewPane *self = data;
+    if (self->overview_task != NULL)
+    {
+        NautilusFolderUsage *usage = g_task_get_task_data (self->overview_task);
+        nautilus_folder_usage_snapshot (usage, &self->usage_result);
+        overview_render (self);
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static void
+overview_scan_thread (GTask *task, gpointer object, gpointer data, GCancellable *cancellable)
+{
+    nautilus_folder_usage_scan (data, cancellable);
+    g_task_return_boolean (task, TRUE);
+}
+
+static void
+overview_scan_ready (GObject *object, GAsyncResult *result, gpointer data)
+{
+    NautilusPreviewPane *self = NAUTILUS_PREVIEW_PANE (object);
+    GTask *task = G_TASK (result);
+    g_task_propagate_boolean (task, NULL);
+    if (task != self->overview_task || !self->overview_active) return;
+    g_clear_handle_id (&self->overview_source, g_source_remove);
+    nautilus_folder_usage_snapshot (g_task_get_task_data (task), &self->usage_result);
+    self->usage_checked = g_get_monotonic_time ();
+    overview_render (self);
+    g_clear_object (&self->overview_task);
+}
+
+static gboolean
+overview_start (gpointer data)
+{
+    NautilusPreviewPane *self = data;
+    self->overview_source = 0;
+    if (!self->overview_active || self->overview_location == NULL || self->overview_loading) return G_SOURCE_REMOVE;
+    g_clear_object (&self->cancellable);
+    self->cancellable = g_cancellable_new ();
+    memset (&self->usage_result, 0, sizeof self->usage_result);
+    self->usage_result.running = TRUE;
+    self->usage_checked = 0;
+    overview_render (self);
+    self->overview_task = g_task_new (self, self->cancellable, overview_scan_ready, NULL);
+    g_task_set_priority (self->overview_task, G_PRIORITY_LOW);
+    g_task_set_task_data (self->overview_task, nautilus_folder_usage_new (self->overview_location),
+                         (GDestroyNotify) nautilus_folder_usage_free);
+    g_task_run_in_thread (self->overview_task, overview_scan_thread);
+    self->overview_source = g_timeout_add (150, overview_progress, self);
+    return G_SOURCE_REMOVE;
+}
+
+static void
+overview_refresh_clicked (GtkButton *button, NautilusPreviewPane *self)
+{
+    if (!self->overview_active) return;
+    if (self->overview_task != NULL)
+    {
+        nautilus_folder_usage_snapshot (g_task_get_task_data (self->overview_task), &self->usage_result);
+        nautilus_preview_pane_cancel (self);
+        self->overview_active = TRUE;
+        self->usage_result.running = FALSE;
+        self->usage_result.cancelled = self->usage_result.partial = TRUE;
+        self->usage_checked = g_get_monotonic_time ();
+        overview_render (self);
+        return;
+    }
+    g_clear_handle_id (&self->overview_source, g_source_remove);
+    if (!self->overview_loading) overview_start (self);
+}
+
+static void
+overview_items_changed (GListModel *model, guint position, guint removed, guint added, NautilusPreviewPane *self)
+{
+    /* Do not restart recursive work on every file-list/filter/sort update. */
+    self->usage_checked = 0;
+    if (self->overview_active && self->overview_task == NULL && self->overview_source == 0 && !self->overview_loading)
+        gtk_label_set_text (self->storage_label, "Folder view changed. Rescan to update totals.");
+}
+
+void
+nautilus_preview_pane_set_context (NautilusPreviewPane *self, GFile *location, GListModel *model, gboolean loading)
+{
+    gboolean same = (location == NULL && self->overview_location == NULL) ||
+        (location != NULL && self->overview_location != NULL && g_file_equal (location, self->overview_location));
+    if (!same || model != self->overview_model)
+    {
+        nautilus_preview_pane_cancel (self);
+        if (self->overview_changed) g_signal_handler_disconnect (self->overview_model, self->overview_changed);
+        self->overview_changed = 0;
+        g_set_object (&self->overview_location, location);
+        g_set_object (&self->overview_model, model);
+        if (model != NULL)
+            self->overview_changed = g_signal_connect (model, "items-changed", G_CALLBACK (overview_items_changed), self);
+        self->usage_checked = 0;
+        memset (&self->usage_result, 0, sizeof self->usage_result);
+    }
+    self->overview_loading = loading;
+}
+
+static void
+show_overview (NautilusPreviewPane *self)
+{
+    self->overview_active = TRUE;
+    gtk_widget_set_visible (self->open, FALSE);
+    gtk_stack_set_visible_child_name (self->stack, "overview");
+    gtk_label_set_text (self->name, "Folder usage");
+    g_autofree char *name = g_file_get_basename (self->overview_location);
+    gtk_label_set_text (self->metadata, name != NULL ? name : "Current folder");
+    overview_render (self);
+    if (self->usage_checked == 0 && !self->usage_result.running &&
+        self->usage_result.files + self->usage_result.folders == 0)
+    {
+        gtk_label_set_text (self->storage_percent, "—");
+        gtk_label_set_text (self->overview_counts, "");
+    }
+    gtk_widget_set_sensitive (self->overview_refresh, !self->overview_loading);
+    if (self->overview_loading)
+        gtk_label_set_text (self->storage_label, "Waiting for this folder to load…");
+    else if (self->usage_checked != 0 && g_get_monotonic_time () - self->usage_checked < 30 * G_USEC_PER_SEC)
+        return;
+    else if (!g_file_is_native (self->overview_location))
+    {
+        gtk_label_set_text (self->storage_label, "Calculate this network folder’s size when you need it.");
+        gtk_button_set_label (GTK_BUTTON (self->overview_refresh), "Calculate folder usage");
+    }
+    else
+    {
+        gtk_label_set_text (self->storage_label, "Preparing folder scan…");
+        /* Avoid starting recursive I/O while a pointer passes over the view. */
+        self->overview_source = g_timeout_add (450, overview_start, self);
+    }
+}
 
 static gboolean
 is_page_document (const char *kind)
@@ -816,6 +1030,9 @@ void
 nautilus_preview_pane_cancel (NautilusPreviewPane *self)
 {
     self->serial++;
+    self->overview_active = FALSE;
+    g_clear_handle_id (&self->overview_source, g_source_remove);
+    g_clear_object (&self->overview_task);
     release_folder_enumerator (&self->folder_enumerator);
     release_zip_cursor (&self->zip_cursor);
     self->folder_loading = FALSE;
@@ -987,6 +1204,7 @@ nautilus_preview_pane_set_files (NautilusPreviewPane *self, GList *files)
     self->document_kind = NULL;
     self->folder = FALSE;
     self->zip = FALSE;
+    gtk_widget_set_visible (self->open, TRUE);
     gtk_button_set_label (GTK_BUTTON (self->open), "Open in application");
     self->page = 1;
     self->total_pages = 0;
@@ -997,6 +1215,11 @@ nautilus_preview_pane_set_files (NautilusPreviewPane *self, GList *files)
     gtk_label_set_text (self->metadata, "");
     if (files == NULL || files->next != NULL)
     {
+        if (files == NULL && self->overview_location != NULL)
+        {
+            show_overview (self);
+            return;
+        }
         guint count = g_list_length (files);
         g_autofree char *title = count == 0 ? g_strdup ("Preview") : g_strdup_printf ("%u items selected", count);
         gtk_label_set_text (self->name, title);
@@ -1103,6 +1326,10 @@ nautilus_preview_pane_dispose (GObject *object)
     NautilusPreviewPane *self = NAUTILUS_PREVIEW_PANE (object);
     nautilus_preview_pane_cancel (self);
     self->folder = FALSE;
+    if (self->overview_changed) g_signal_handler_disconnect (self->overview_model, self->overview_changed);
+    self->overview_changed = 0;
+    g_clear_object (&self->overview_model);
+    g_clear_object (&self->overview_location);
     g_clear_object (&self->folder_items);
     g_clear_object (&self->file);
     g_clear_pointer (&self->contents, g_free);
@@ -1164,6 +1391,59 @@ nautilus_preview_pane_init (NautilusPreviewPane *self)
     gtk_label_set_wrap (self->message, TRUE);
     gtk_widget_add_css_class (GTK_WIDGET (self->message), "dim-label");
     gtk_stack_add_named (self->stack, GTK_WIDGET (self->message), "message");
+    GtkWidget *overview = gtk_box_new (GTK_ORIENTATION_VERTICAL, 8);
+    self->storage_chart = GTK_DRAWING_AREA (gtk_drawing_area_new ());
+    gtk_drawing_area_set_content_height (self->storage_chart, 180);
+    gtk_drawing_area_set_draw_func (self->storage_chart, overview_draw, self, NULL);
+    /* The adjacent label provides the complete accessible storage values. */
+    gtk_accessible_update_property (GTK_ACCESSIBLE (self->storage_chart),
+        GTK_ACCESSIBLE_PROPERTY_LABEL, "Storage used by this folder’s contents", -1);
+    GtkWidget *storage_overlay = gtk_overlay_new ();
+    gtk_overlay_set_child (GTK_OVERLAY (storage_overlay), GTK_WIDGET (self->storage_chart));
+    self->storage_percent = GTK_LABEL (gtk_label_new ("…"));
+    gtk_label_set_justify (self->storage_percent, GTK_JUSTIFY_CENTER);
+    gtk_widget_add_css_class (GTK_WIDGET (self->storage_percent), "title-2");
+    gtk_widget_set_halign (GTK_WIDGET (self->storage_percent), GTK_ALIGN_CENTER);
+    gtk_widget_set_valign (GTK_WIDGET (self->storage_percent), GTK_ALIGN_CENTER);
+    gtk_overlay_add_overlay (GTK_OVERLAY (storage_overlay), GTK_WIDGET (self->storage_percent));
+    gtk_box_append (GTK_BOX (overview), storage_overlay);
+    self->storage_label = GTK_LABEL (gtk_label_new ("Preparing folder scan…"));
+    gtk_label_set_wrap (self->storage_label, TRUE);
+    gtk_box_append (GTK_BOX (overview), GTK_WIDGET (self->storage_label));
+    self->overview_counts = GTK_LABEL (gtk_label_new (""));
+    gtk_label_set_wrap (self->overview_counts, TRUE);
+    gtk_widget_add_css_class (GTK_WIDGET (self->overview_counts), "heading");
+    gtk_box_append (GTK_BOX (overview), GTK_WIDGET (self->overview_counts));
+    for (guint i = 0; i < NAUTILUS_USAGE_SEGMENTS; i++)
+    {
+        GtkWidget *row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 8);
+        self->overview_rows[i] = row;
+        GtkWidget *dot = gtk_label_new (NULL);
+        g_autofree char *markup = g_strdup_printf ("<span foreground=\"%s\">●</span>", usage_colors[i]);
+        gtk_label_set_markup (GTK_LABEL (dot), markup);
+        gtk_box_append (GTK_BOX (row), dot);
+        self->overview_names[i] = GTK_LABEL (gtk_label_new (NULL));
+        gtk_label_set_xalign (self->overview_names[i], 0);
+        gtk_label_set_ellipsize (self->overview_names[i], PANGO_ELLIPSIZE_MIDDLE);
+        gtk_widget_set_hexpand (GTK_WIDGET (self->overview_names[i]), TRUE);
+        gtk_box_append (GTK_BOX (row), GTK_WIDGET (self->overview_names[i]));
+        self->overview_values[i] = GTK_LABEL (gtk_label_new (NULL));
+        gtk_widget_add_css_class (GTK_WIDGET (self->overview_values[i]), "caption");
+        gtk_box_append (GTK_BOX (row), GTK_WIDGET (self->overview_values[i]));
+        gtk_box_append (GTK_BOX (overview), row);
+    }
+    GtkWidget *note = gtk_label_new ("Includes nested and hidden items. File sizes are logical sizes; links are counted but not followed. The six largest subfolders are shown separately.");
+    gtk_label_set_wrap (GTK_LABEL (note), TRUE);
+    gtk_widget_add_css_class (note, "dim-label");
+    gtk_widget_add_css_class (note, "caption");
+    gtk_box_append (GTK_BOX (overview), note);
+    self->overview_refresh = gtk_button_new_with_label ("Rescan folder");
+    g_signal_connect (self->overview_refresh, "clicked", G_CALLBACK (overview_refresh_clicked), self);
+    gtk_box_append (GTK_BOX (overview), self->overview_refresh);
+    GtkWidget *overview_scroll = gtk_scrolled_window_new ();
+    gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (overview_scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (overview_scroll), overview);
+    gtk_stack_add_named (self->stack, overview_scroll, "overview");
     self->picture = GTK_PICTURE (gtk_picture_new ());
     gtk_picture_set_can_shrink (self->picture, TRUE);
     gtk_picture_set_content_fit (self->picture, GTK_CONTENT_FIT_CONTAIN);

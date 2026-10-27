@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- An unselected folder now shows a coloured breakdown of its subfolder sizes, loose files, total size, and recursive item count. Metadata scans run in the background with bounded aggregates, cancellation, progress, Stop/Rescan controls, short-lived caching, network opt-in, and labelled partial totals.
+
 - Local ZIP/ZIP64 archive contents now preview in 32-entry pages without extraction, with stored paths, uncompressed sizes, encrypted-entry labels, and bounded central-directory metadata.
 
 - Folder previews now load the first 32 entries and fetch subsequent batches as you scroll, with a virtualized list, Load more control, bounded hidden-item scans, and no 500-item total cap.
