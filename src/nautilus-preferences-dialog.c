@@ -185,6 +185,11 @@ nautilus_preferences_dialog_setup (GtkBuilder *builder)
                        NAUTILUS_PREFERENCES_DIALOG_DELETE_PERMANENTLY_WIDGET,
                        NAUTILUS_PREFERENCES_SHOW_DELETE_PERMANENTLY);
 
+    g_settings_bind (nautilus_preferences, "folder-usage-item-limit",
+                     gtk_builder_get_object (builder, "folder_usage_items_row"), "value", G_SETTINGS_BIND_DEFAULT);
+    g_settings_bind (nautilus_preferences, "folder-usage-time-limit",
+                     gtk_builder_get_object (builder, "folder_usage_seconds_row"), "value", G_SETTINGS_BIND_DEFAULT);
+
     setup_detailed_date (builder);
 
     bind_builder_combo_row (builder, nautilus_preferences,

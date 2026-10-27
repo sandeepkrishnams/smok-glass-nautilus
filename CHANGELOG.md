@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Raised folder-usage defaults to 5 million items / 120 seconds, with persistent item/time controls under Preferences → Folder Usage Preview and a per-scan bypass button. Partial sizes now show ≥ and item counts say counted so far; Stop/cancellation and bounded traversal depth remain available.
+
 - An unselected folder now shows a coloured breakdown of its subfolder sizes, loose files, total size, and recursive item count. Metadata scans run in the background with bounded aggregates, cancellation, progress, Stop/Rescan controls, short-lived caching, network opt-in, and labelled partial totals.
 
 - Local ZIP/ZIP64 archive contents now preview in 32-entry pages without extraction, with stored paths, uncompressed sizes, encrypted-entry labels, and bounded central-directory metadata.

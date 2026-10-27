@@ -2,6 +2,8 @@
 set -euo pipefail
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 build_dir=${BUILD_DIR:-"$project_dir/build"}
+# Targeted binary builds do not rebuild the GSettings schema automatically.
+ninja -C "$build_dir" data/gschemas.compiled >/dev/null
 export SMOK_GLASS_TEST_DATA="$project_dir/samples"
 export SMOK_GLASS_TEST_OUTPUT="$project_dir/test-artifacts"
 export GSETTINGS_SCHEMA_DIR="$build_dir/data"

@@ -3,6 +3,7 @@
 #include "nautilus-preview-pane.c"
 #undef G_LOG_DOMAIN
 #include "nautilus-window-slot.c"
+#include "nautilus-preferences-dialog.c"
 #include "nautilus-grid-cell.h"
 #include "nautilus-view-model.h"
 #include <glib/gstdio.h>
@@ -112,6 +113,13 @@ wait_for_overview (NautilusPreviewPane *pane)
     gint64 deadline = g_get_monotonic_time () + 10 * G_USEC_PER_SEC;
     while ((pane->overview_source != 0 || pane->overview_task != NULL) &&
            g_get_monotonic_time () < deadline) pump (1);
+    if (pane->overview_task != NULL)
+    {
+        NautilusUsageResult snapshot;
+        nautilus_folder_usage_snapshot (g_task_get_task_data (pane->overview_task), &snapshot);
+        g_printerr ("Overview timeout: worker_running=%d files=%" G_GUINT64_FORMAT " label=%s\n",
+            snapshot.running, snapshot.files, gtk_label_get_text (pane->storage_label));
+    }
     g_assert_cmpuint (pane->overview_source, ==, 0);
     g_assert_null (pane->overview_task);
     g_assert_false (pane->usage_result.running);
@@ -180,7 +188,9 @@ check_overview (NautilusPreviewPane *pane, GtkWidget *window, NautilusFile *text
     g_print ("PASS folder usage recursive sizes, nested counts, hidden files and loose-file grouping\n");
     g_print ("PASS usage avoids symlink traversal, special-file reads and sparse-file payloads\n");
     set_capture_path ("folder-overview.png");
+    gtk_window_set_default_size (GTK_WINDOW (window), 390, 780);
     pump (300); capture (window);
+    gtk_window_set_default_size (GTK_WINDOW (window), 390, 650);
     g_print ("PASS folder usage multicolour donut and matching size/percentage legend\n");
     gint64 checked = pane->usage_checked;
     select_file (pane, text_file);
@@ -281,6 +291,67 @@ check_overview (NautilusPreviewPane *pane, GtkWidget *window, NautilusFile *text
     g_assert_cmpuint (result.files, ==, 0);
     nautilus_folder_usage_free (usage);
     g_print ("PASS usage depth safety limit and already-cancelled scan\n");
+    g_autoptr (GtkBuilder) preferences = gtk_builder_new_from_resource (
+        "/org/gnome/nautilus/ui/nautilus-preferences-dialog.ui");
+    nautilus_preferences_dialog_setup (preferences);
+    AdwSpinRow *item_row = ADW_SPIN_ROW (gtk_builder_get_object (preferences, "folder_usage_items_row"));
+    AdwSpinRow *time_row = ADW_SPIN_ROW (gtk_builder_get_object (preferences, "folder_usage_seconds_row"));
+    g_assert_cmpfloat (adw_spin_row_get_value (item_row), ==, 5000000);
+    g_assert_cmpfloat (adw_spin_row_get_value (time_row), ==, 120);
+    adw_spin_row_set_value (item_row, 1000);
+    g_assert_cmpuint (g_settings_get_uint (nautilus_preferences, "folder-usage-item-limit"), ==, 1000);
+    g_settings_set_uint (nautilus_preferences, "folder-usage-time-limit", 240);
+    g_assert_cmpfloat (adw_spin_row_get_value (time_row), ==, 240);
+    g_print ("PASS usage preferences UI defaults and bidirectional persistent settings bindings\n");
+    g_autofree char *limited = g_build_filename (temp, "Limited", NULL);
+    g_mkdir (limited, 0700);
+    for (guint i = 0; i < 1007; i++)
+    {
+        g_autofree char *name = g_strdup_printf ("item-%u", i);
+        usage_test_file (limited, name, 1);
+    }
+    g_autoptr (GFile) limited_location = g_file_new_for_path (limited);
+    nautilus_preview_pane_set_context (pane, limited_location, NULL, FALSE);
+    nautilus_preview_pane_set_files (pane, NULL);
+    wait_for_overview (pane);
+    g_assert_cmpuint (pane->usage_result.files, ==, 1000);
+    g_assert_true (pane->usage_result.limited);
+    g_assert_true (g_str_has_prefix (gtk_label_get_text (pane->storage_percent), "≥"));
+    g_assert_nonnull (strstr (gtk_label_get_text (pane->overview_counts), "so far"));
+    g_print ("PASS configured item limit and clearly marked lower-bound values\n");
+    overview_bypass_clicked (NULL, pane);
+    g_assert_true (pane->usage_bypass);
+    g_assert_false (gtk_widget_get_sensitive (pane->overview_bypass));
+    wait_for_overview (pane);
+    g_assert_cmpuint (pane->usage_result.files, ==, 1007);
+    g_assert_cmpuint (pane->usage_result.bytes, ==, 1007);
+    g_assert_false (pane->usage_result.partial);
+    g_assert_false (g_str_has_prefix (gtk_label_get_text (pane->storage_percent), "≥"));
+    g_assert_cmpuint (g_settings_get_uint (nautilus_preferences, "folder-usage-item-limit"), ==, 1000);
+    g_print ("PASS one-scan bypass completes beyond the configured limit without changing settings\n");
+    overview_refresh_clicked (NULL, pane);
+    g_assert_false (pane->usage_bypass);
+    wait_for_overview (pane);
+    g_assert_cmpuint (pane->usage_result.files, ==, 1000);
+    g_assert_true (pane->usage_result.partial);
+    overview_bypass_clicked (NULL, pane);
+    overview_refresh_clicked (NULL, pane);
+    g_assert_true (pane->usage_result.cancelled);
+    pump (100);
+    g_assert_true (pane->usage_result.cancelled);
+    g_print ("PASS normal rescans restore limits and bypass scans remain cancellable\n");
+    g_settings_reset (nautilus_preferences, "folder-usage-item-limit");
+    g_settings_reset (nautilus_preferences, "folder-usage-time-limit");
+    usage = nautilus_folder_usage_new (deep_location);
+    nautilus_folder_usage_set_limits (usage, 0, 0);
+    g_cancellable_reset (cancel);
+    nautilus_folder_usage_scan (usage, cancel);
+    nautilus_folder_usage_snapshot (usage, &result);
+    g_assert_true (result.depth_limited);
+    g_assert_cmpuint (result.folders, ==, 64);
+    nautilus_folder_usage_free (usage);
+    g_print ("PASS bypass retains bounded traversal depth\n");
+
     /* Exercise actual slot navigation, not just the standalone widget API. */
     NautilusWindowSlot *slot = nautilus_window_slot_new (NAUTILUS_MODE_BROWSE);
     GtkWidget *slot_window = gtk_window_new ();

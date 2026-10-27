@@ -4,8 +4,6 @@
 #include <stdlib.h>
 
 #define USAGE_MAX_DEPTH 64
-#define USAGE_MAX_ITEMS 200000
-#define USAGE_MAX_TIME (30 * G_USEC_PER_SEC)
 
 struct _NautilusFolderUsage
 {
@@ -15,6 +13,8 @@ struct _NautilusFolderUsage
     NautilusUsageSegment top[NAUTILUS_USAGE_TOP_FOLDERS], current;
     guint top_count, other_count, loose_count;
     guint64 other_bytes, loose_bytes;
+    guint64 item_limit;
+    guint seconds_limit;
     gint64 started, last_publish;
     gboolean current_active, halted;
 };
@@ -26,7 +26,17 @@ nautilus_folder_usage_new (GFile *location)
     usage->location = g_object_ref (location);
     g_mutex_init (&usage->mutex);
     usage->published.running = TRUE;
+    usage->item_limit = NAUTILUS_USAGE_DEFAULT_ITEMS;
+    usage->seconds_limit = NAUTILUS_USAGE_DEFAULT_SECONDS;
     return usage;
+}
+
+void
+nautilus_folder_usage_set_limits (NautilusFolderUsage *usage, guint64 items, guint seconds)
+{
+    g_return_if_fail (usage->started == 0);
+    usage->item_limit = items;
+    usage->seconds_limit = seconds;
 }
 
 void
@@ -109,8 +119,9 @@ can_continue (NautilusFolderUsage *usage, GCancellable *cancellable)
     {
         usage->totals.cancelled = usage->totals.partial = usage->halted = TRUE;
     }
-    else if (usage->totals.files + usage->totals.folders >= USAGE_MAX_ITEMS ||
-             g_get_monotonic_time () - usage->started >= USAGE_MAX_TIME)
+    else if ((usage->item_limit > 0 && usage->totals.files + usage->totals.folders >= usage->item_limit) ||
+             (usage->seconds_limit > 0 && g_get_monotonic_time () - usage->started >=
+              (gint64) usage->seconds_limit * G_USEC_PER_SEC))
     {
         usage->totals.limited = usage->totals.partial = usage->halted = TRUE;
     }
@@ -135,6 +146,7 @@ scan_directory (NautilusFolderUsage *usage, GFile *directory, guint depth, GCanc
     if (!can_continue (usage, cancellable)) return;
     if (depth >= USAGE_MAX_DEPTH)
     {
+        usage->totals.depth_limited = TRUE;
         usage->totals.limited = usage->totals.partial = TRUE;
         usage->totals.skipped++;
         return;

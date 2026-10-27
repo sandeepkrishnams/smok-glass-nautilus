@@ -66,6 +66,36 @@ Adw.PreferencesDialog preferences_dialog {
     }
 
     Adw.PreferencesGroup {
+      title: _("Folder Usage Preview");
+      description: _("Limits apply to the next scan. Use Scan without limits in the preview to bypass item and time limits once. Stop remains available.");
+
+      Adw.SpinRow folder_usage_items_row {
+        title: _("Maximum items to scan");
+        subtitle: _("Includes nested files and folders");
+        digits: 0;
+        adjustment: Gtk.Adjustment {
+          lower: 1000;
+          upper: 100000000;
+          step-increment: 1000;
+          page-increment: 100000;
+          value: 5000000;
+        };
+      }
+
+      Adw.SpinRow folder_usage_seconds_row {
+        title: _("Maximum scan time (seconds)");
+        digits: 0;
+        adjustment: Gtk.Adjustment {
+          lower: 1;
+          upper: 3600;
+          step-increment: 10;
+          page-increment: 60;
+          value: 120;
+        };
+      }
+    }
+
+    Adw.PreferencesGroup {
       title: _("Date and Time Format");
       description: _("Choose how dates and times are displayed in list and grid views.");
 

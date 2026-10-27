@@ -38,13 +38,13 @@ struct _NautilusPreviewPane
     GtkLabel *message;
     GtkDrawingArea *storage_chart;
     GtkLabel *storage_label, *storage_percent, *overview_counts;
-    GtkWidget *overview_rows[NAUTILUS_USAGE_SEGMENTS], *overview_refresh;
+    GtkWidget *overview_rows[NAUTILUS_USAGE_SEGMENTS], *overview_refresh, *overview_bypass;
     GtkLabel *overview_names[NAUTILUS_USAGE_SEGMENTS], *overview_values[NAUTILUS_USAGE_SEGMENTS];
     GFile *overview_location;
     GListModel *overview_model;
     gulong overview_changed;
     guint overview_source;
-    gboolean overview_active, overview_loading;
+    gboolean overview_active, overview_loading, usage_bypass;
     GTask *overview_task;
     NautilusUsageResult usage_result;
     gint64 usage_checked;
@@ -143,16 +143,20 @@ overview_render (NautilusPreviewPane *self)
 {
     NautilusUsageResult *result = &self->usage_result;
     g_autofree char *size = g_format_size (result->bytes);
-    gtk_label_set_text (self->storage_percent, size);
+    g_autofree char *display_size = result->partial || result->running ? g_strdup_printf ("≥ %s", size) : g_strdup (size);
+    gtk_label_set_text (self->storage_percent, display_size);
     gtk_label_set_text (self->storage_label,
         result->unreadable ? "Unable to read this folder." :
-        result->running ? "Scanning… sizes and shares so far" :
+        result->running ? (self->usage_bypass ? "Scanning without item/time limits… sizes so far" : "Scanning… sizes and shares so far") :
         result->cancelled ? "Scan stopped — totals are partial." :
-        result->partial ? "Partial totals — some paths were unreadable or a scan limit was reached." :
+        result->depth_limited ? "Partial totals — a folder exceeds the supported nesting depth." :
+        result->limited ? "Partial totals — item/time limit reached. Scan without limits to recalculate." :
+        result->partial ? "Partial totals — some paths could not be read." :
         result->files + result->folders == 0 ? "This folder is empty." : "Total file sizes in this folder");
     guint64 items = result->files + result->folders;
     g_autofree char *counts = g_strdup_printf ("%" G_GUINT64_FORMAT " items · %" G_GUINT64_FORMAT
-        " files · %" G_GUINT64_FORMAT " folders", items, result->files, result->folders);
+        " files · %" G_GUINT64_FORMAT " folders%s", items, result->files, result->folders,
+        result->partial || result->running ? " · counted so far" : "");
     gtk_label_set_text (self->overview_counts, counts);
     for (guint i = 0; i < NAUTILUS_USAGE_SEGMENTS; i++)
     {
@@ -167,6 +171,7 @@ overview_render (NautilusPreviewPane *self)
         gtk_label_set_text (self->overview_values[i], value);
     }
     gtk_button_set_label (GTK_BUTTON (self->overview_refresh), result->running ? "Stop scan" : "Rescan folder");
+    gtk_widget_set_sensitive (self->overview_bypass, !result->running && !self->overview_loading);
     gtk_widget_queue_draw (GTK_WIDGET (self->storage_chart));
 }
 
@@ -204,12 +209,11 @@ overview_scan_ready (GObject *object, GAsyncResult *result, gpointer data)
     g_clear_object (&self->overview_task);
 }
 
-static gboolean
-overview_start (gpointer data)
+static void
+overview_begin (NautilusPreviewPane *self, gboolean bypass)
 {
-    NautilusPreviewPane *self = data;
-    self->overview_source = 0;
-    if (!self->overview_active || self->overview_location == NULL || self->overview_loading) return G_SOURCE_REMOVE;
+    if (!self->overview_active || self->overview_location == NULL || self->overview_loading || self->overview_task != NULL) return;
+    self->usage_bypass = bypass;
     g_clear_object (&self->cancellable);
     self->cancellable = g_cancellable_new ();
     memset (&self->usage_result, 0, sizeof self->usage_result);
@@ -218,11 +222,30 @@ overview_start (gpointer data)
     overview_render (self);
     self->overview_task = g_task_new (self, self->cancellable, overview_scan_ready, NULL);
     g_task_set_priority (self->overview_task, G_PRIORITY_LOW);
-    g_task_set_task_data (self->overview_task, nautilus_folder_usage_new (self->overview_location),
-                         (GDestroyNotify) nautilus_folder_usage_free);
+    NautilusFolderUsage *usage = nautilus_folder_usage_new (self->overview_location);
+    nautilus_folder_usage_set_limits (usage,
+        bypass ? 0 : g_settings_get_uint (nautilus_preferences, "folder-usage-item-limit"),
+        bypass ? 0 : g_settings_get_uint (nautilus_preferences, "folder-usage-time-limit"));
+    g_task_set_task_data (self->overview_task, usage, (GDestroyNotify) nautilus_folder_usage_free);
     g_task_run_in_thread (self->overview_task, overview_scan_thread);
     self->overview_source = g_timeout_add (150, overview_progress, self);
+}
+
+static gboolean
+overview_start (gpointer data)
+{
+    NautilusPreviewPane *self = data;
+    self->overview_source = 0;
+    overview_begin (self, FALSE);
     return G_SOURCE_REMOVE;
+}
+
+static void
+overview_bypass_clicked (GtkButton *button, NautilusPreviewPane *self)
+{
+    if (!self->overview_active || self->overview_loading || self->overview_task != NULL) return;
+    g_clear_handle_id (&self->overview_source, g_source_remove);
+    overview_begin (self, TRUE);
 }
 
 static void
@@ -1440,6 +1463,15 @@ nautilus_preview_pane_init (NautilusPreviewPane *self)
     self->overview_refresh = gtk_button_new_with_label ("Rescan folder");
     g_signal_connect (self->overview_refresh, "clicked", G_CALLBACK (overview_refresh_clicked), self);
     gtk_box_append (GTK_BOX (overview), self->overview_refresh);
+    self->overview_bypass = gtk_button_new_with_label ("Scan without limits");
+    gtk_widget_set_tooltip_text (self->overview_bypass,
+        "Start a fresh scan without item or time limits. Stop and cancellation remain available; the 64-level depth bound still applies.");
+    g_signal_connect (self->overview_bypass, "clicked", G_CALLBACK (overview_bypass_clicked), self);
+    gtk_box_append (GTK_BOX (overview), self->overview_bypass);
+    GtkWidget *usage_settings = gtk_button_new_with_label ("Scan settings");
+    gtk_widget_add_css_class (usage_settings, "flat");
+    gtk_actionable_set_action_name (GTK_ACTIONABLE (usage_settings), "app.preferences");
+    gtk_box_append (GTK_BOX (overview), usage_settings);
     GtkWidget *overview_scroll = gtk_scrolled_window_new ();
     gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (overview_scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
     gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (overview_scroll), overview);

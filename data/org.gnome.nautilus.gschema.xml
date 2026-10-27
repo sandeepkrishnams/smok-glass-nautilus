@@ -77,6 +77,18 @@
   </schema>
 
   <schema path="/org/gnome/nautilus/preferences/" id="org.gnome.nautilus.preferences" gettext-domain="nautilus">
+    <key name="folder-usage-item-limit" type="u">
+      <range min="1000" max="100000000"/>
+      <default>5000000</default>
+      <summary>Maximum items per folder usage scan</summary>
+      <description>Counts files and folders, including nested and hidden items. Applies to the next scan; the preview can bypass this limit for a single scan.</description>
+    </key>
+    <key name="folder-usage-time-limit" type="u">
+      <range min="1" max="3600"/>
+      <default>120</default>
+      <summary>Maximum folder usage scan duration in seconds</summary>
+      <description>Checked between metadata operations. Applies to the next scan; the preview can bypass this limit for a single scan.</description>
+    </key>
     <key name="preview-pane-visible" type="b">
       <default>true</default>
       <summary>Show the embedded preview pane</summary>
