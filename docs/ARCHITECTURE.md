@@ -6,6 +6,7 @@
 
 | File type | Preview path |
 | --- | --- |
+| Folders | Cancellable GIO enumeration off the main thread → sorted, read-only GTK list |
 | Text/Markdown | Bounded file reads, GtkTextView, local CommonMark rendering |
 | Images | Glycin sandboxed decode, GtkPicture |
 | PDF | Poppler page rasterization, Glycin texture loading |
@@ -21,3 +22,5 @@ The spreadsheet view has JavaScript disabled and a restrictive Content Security 
 `scripts/launchers.py` manages the optional per-user launcher overrides and records backups under `$XDG_STATE_HOME/smok-glass-nautilus`. It does not replace `/usr/bin/nautilus`.
 
 The source tree includes original upstream components and tests. `src/nautilus-preview-check.c` provides extra native integration checks. `tests/test_document_previews.py` tests the helper layer without requiring a display.
+
+Folder enumeration reads only immediate child metadata without following child symlinks. It caps visible results at 500 and scanned entries at 10,000, then sorts the bounded result with folders first and natural filename collation. Hidden/backup entries follow the GTK file chooser preference, including changes while a folder is selected. No recursive size calculation or file-content reads are performed.

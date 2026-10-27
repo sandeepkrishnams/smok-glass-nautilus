@@ -1,6 +1,6 @@
 # Smok Glass Nautilus
 
-A Nautilus file manager with a built-in, read-only preview pane. Select a file once to see it on the right: formatted document pages, a spreadsheet grid, images, Markdown, and plain text.
+A Nautilus file manager with a built-in, read-only preview pane. Select a file or folder once to see it on the right: folder contents, formatted document pages, a spreadsheet grid, images, Markdown, and plain text.
 
 Based on **GNOME Nautilus 50.2.2**. This repository contains the complete modified source, local document readers, sample files, and per-user installation tools.
 
@@ -11,6 +11,12 @@ Based on **GNOME Nautilus 50.2.2**. This repository contains the complete modifi
 Column letters, row numbers, worksheet tabs, merged cells, colours, borders, and common number formats—all inside the preview pane.
 
 ![Read-only spreadsheet preview showing a styled workbook with worksheet tabs](docs/screenshots/spreadsheet-preview.png)
+
+### Folder preview
+
+Select a folder to see its immediate files and subfolders, with folders first, file icons, sizes, and an item summary. **Ctrl+H** also updates hidden items in the preview.
+
+<img src="docs/screenshots/folder-preview.png" alt="A folder preview listing subfolders, files and a shortcut" width="390">
 
 ### Document preview
 
@@ -24,6 +30,7 @@ These are real captures from the native preview widget using the sample files in
 
 - Embedded, resizable right preview pane; **Ctrl+Shift+P** toggles it.
 - Single-click and arrow-key selection update the preview. Double-click opens the file normally.
+- Folder contents with folders first, file icons and sizes, hidden-item preference, and empty-folder states.
 - Rendered Markdown with a source toggle; scrollable, selectable plain text.
 - Image previews through GNOME's sandboxed Glycin loaders.
 - Formatted PDF, DOCX, ODT, DOC, and RTF pages with Previous/Next controls.
@@ -75,7 +82,7 @@ Existing system Nautilus extension modules are reused where available. The defau
 | Action | Control |
 | --- | --- |
 | Show/hide preview | **Ctrl+Shift+P**, or View menu → Preview Pane |
-| Change preview | Click a file, or use **↑ / ↓** in the file list |
+| Change preview | Click a file or folder, or use **↑ / ↓** in the file list |
 | Resize pane | Drag its divider |
 | Browse document pages | Previous/Next buttons beneath the page |
 | Change worksheet | Tabs beneath the spreadsheet grid |
@@ -85,6 +92,7 @@ Existing system Nautilus extension modules are reused where available. The defau
 ## Preview limits
 
 - Local files only; unsupported and remote files offer the normal Open action.
+- Folder previews list immediate children only, with up to 500 visible items and 10,000 entries scanned. Limited previews say so; use **Open folder** to browse the full listing. Symlinks inside a folder are listed without following their targets.
 - Text previews stop after 512 KiB. Document and image input files above 100 MiB show a fallback.
 - Spreadsheet previews show up to 5 visible sheets, 200 rows and 30 columns per sheet.
 - Spreadsheet formulas are not recalculated. Saved results are shown; `—` marks a formula without a saved result. Charts, embedded drawings, conditional formatting, and every Excel number-format variant are not implemented.

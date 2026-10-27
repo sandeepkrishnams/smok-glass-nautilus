@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "config.h"
 #include "nautilus-preview-pane.h"
+#include "nautilus-global-preferences.h"
 #include <adwaita.h>
 #include <cmark.h>
 #include <glycin.h>
@@ -12,6 +13,8 @@
 #include <webkit/webkit.h>
 
 #define TEXT_LIMIT (512 * 1024)
+#define FOLDER_LIMIT 500
+#define FOLDER_SCAN_LIMIT 10000
 
 struct _NautilusPreviewPane
 {
@@ -30,6 +33,8 @@ struct _NautilusPreviewPane
     GtkWidget *next_page;
     GtkLabel *page_label;
     WebKitWebView *sheet;
+    GtkListBox *folder_list;
+    gboolean folder;
     const char *document_kind;
     guint page, total_pages;
     GFile *file;
@@ -55,6 +60,8 @@ typedef struct
     char *document_kind;
     char *temporary_directory;
     guint page, total_pages;
+    gboolean folder, show_hidden;
+    GPtrArray *entries;
 } PreviewLoad;
 
 static gboolean
@@ -97,6 +104,7 @@ preview_load_free (gpointer data)
     g_clear_object (&load->frame);
     g_free (load->text);
     g_free (load->document_kind);
+    g_clear_pointer (&load->entries, g_ptr_array_unref);
     if (load->temporary_directory != NULL)
     {
         remove_preview_directory (load->temporary_directory);
@@ -162,6 +170,48 @@ load_document (PreviewLoad *load, GCancellable *cancel, GError **error)
     return TRUE;
 }
 
+static gint
+compare_folder_entries (gconstpointer a, gconstpointer b)
+{
+    GFileInfo *first = *(GFileInfo * const *) a;
+    GFileInfo *second = *(GFileInfo * const *) b;
+    gboolean first_directory = g_file_info_get_file_type (first) == G_FILE_TYPE_DIRECTORY;
+    gboolean second_directory = g_file_info_get_file_type (second) == G_FILE_TYPE_DIRECTORY;
+    if (first_directory != second_directory) return first_directory ? -1 : 1;
+    g_autofree char *first_key = g_utf8_collate_key_for_filename (g_file_info_get_display_name (first), -1);
+    g_autofree char *second_key = g_utf8_collate_key_for_filename (g_file_info_get_display_name (second), -1);
+    return strcmp (first_key, second_key);
+}
+
+static gboolean
+load_folder (PreviewLoad *load, GCancellable *cancel, GError **error)
+{
+    g_autoptr (GFileEnumerator) enumerator = g_file_enumerate_children (
+        load->file, "standard::name,standard::display-name,standard::type,standard::size,"
+                    "standard::icon,standard::is-hidden,standard::is-backup,standard::is-symlink",
+        G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancel, error);
+    if (enumerator == NULL) return FALSE;
+    load->entries = g_ptr_array_new_with_free_func (g_object_unref);
+    for (guint scanned = 0; scanned <= FOLDER_SCAN_LIMIT; scanned++)
+    {
+        g_autoptr (GFileInfo) info = g_file_enumerator_next_file (enumerator, cancel, error);
+        if (info == NULL) return *error == NULL;
+        if (scanned == FOLDER_SCAN_LIMIT)
+        {
+            load->truncated = TRUE;
+            break;
+        }
+        if (!load->show_hidden && (g_file_info_get_is_hidden (info) || g_file_info_get_is_backup (info))) continue;
+        if (load->entries->len == FOLDER_LIMIT)
+        {
+            load->truncated = TRUE;
+            break;
+        }
+        g_ptr_array_add (load->entries, g_steal_pointer (&info));
+    }
+    return TRUE;
+}
+
 /* File I/O and sandboxed image decoding run off the GTK main thread. */
 static void
 preview_load_thread (GTask *task, gpointer object, gpointer data, GCancellable *cancel)
@@ -169,6 +219,17 @@ preview_load_thread (GTask *task, gpointer object, gpointer data, GCancellable *
     PreviewLoad *load = data;
     g_autoptr (GError) error = NULL;
     if (g_task_return_error_if_cancelled (task)) return;
+    if (load->folder)
+    {
+        if (!load_folder (load, cancel, &error))
+            g_task_return_error (task, g_steal_pointer (&error));
+        else
+        {
+            g_ptr_array_sort (load->entries, compare_folder_entries);
+            g_task_return_boolean (task, TRUE);
+        }
+        return;
+    }
     if (load->document_kind != NULL)
     {
         if (!load_document (load, cancel, &error))
@@ -350,7 +411,53 @@ preview_loaded (GObject *object, GAsyncResult *result, gpointer data)
         gtk_stack_set_visible_child_name (self->stack, "message");
         return;
     }
-    if (load->image)
+    if (load->folder)
+    {
+        guint folders = 0;
+        for (guint i = 0; i < load->entries->len; i++)
+        {
+            GFileInfo *info = g_ptr_array_index (load->entries, i);
+            gboolean directory = g_file_info_get_file_type (info) == G_FILE_TYPE_DIRECTORY;
+            folders += directory;
+            GtkWidget *row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 10);
+            gtk_widget_set_margin_top (row, 8);
+            gtk_widget_set_margin_bottom (row, 8);
+            gtk_widget_set_margin_start (row, 8);
+            gtk_widget_set_margin_end (row, 8);
+            GIcon *icon = g_file_info_get_icon (info);
+            GtkWidget *image = g_file_info_get_is_symlink (info) ? gtk_image_new_from_icon_name ("insert-link-symbolic") :
+                               icon != NULL ? gtk_image_new_from_gicon (icon)
+                                           : gtk_image_new_from_icon_name (directory ? "folder-symbolic" : "text-x-generic-symbolic");
+            gtk_image_set_pixel_size (GTK_IMAGE (image), 24);
+            gtk_box_append (GTK_BOX (row), image);
+            GtkWidget *label = gtk_label_new (g_file_info_get_display_name (info));
+            gtk_label_set_xalign (GTK_LABEL (label), 0);
+            gtk_label_set_ellipsize (GTK_LABEL (label), PANGO_ELLIPSIZE_MIDDLE);
+            gtk_widget_set_hexpand (label, TRUE);
+            gtk_widget_set_tooltip_text (label, g_file_info_get_display_name (info));
+            gtk_box_append (GTK_BOX (row), label);
+            g_autofree char *detail = directory ? g_strdup ("Folder") :
+                g_file_info_get_is_symlink (info) ? g_strdup ("Link") :
+                g_file_info_get_file_type (info) == G_FILE_TYPE_REGULAR ? g_format_size (g_file_info_get_size (info)) : g_strdup ("File");
+            GtkWidget *size = gtk_label_new (detail);
+            gtk_widget_add_css_class (size, "dim-label");
+            gtk_widget_add_css_class (size, "caption");
+            gtk_box_append (GTK_BOX (row), size);
+            gtk_list_box_append (self->folder_list, row);
+        }
+        g_autofree char *summary = g_strdup_printf ("%u %s · %u %s%s", folders, folders == 1 ? "folder" : "folders",
+            load->entries->len - folders, load->entries->len - folders == 1 ? "file" : "files", load->show_hidden ? " · including hidden items" : " · hidden items excluded");
+        g_autofree char *metadata = load->truncated ? g_strdup_printf ("Showing %u items · listing limited\n%s", load->entries->len, summary) : g_strdup (summary);
+        gtk_label_set_text (self->metadata, metadata);
+        if (load->entries->len == 0)
+        {
+            gtk_label_set_text (self->message, load->truncated ? "No visible items within the preview limit. Open the folder to browse everything." :
+                                load->show_hidden ? "This folder is empty." : "No visible items in this folder.");
+            gtk_stack_set_visible_child_name (self->stack, "message");
+        }
+        else gtk_stack_set_visible_child_name (self->stack, "folder");
+    }
+    else if (load->image)
     {
         g_autoptr (GdkTexture) texture = gly_gtk_frame_get_texture (load->frame);
         gtk_picture_set_paintable (self->picture, GDK_PAINTABLE (texture));
@@ -432,6 +539,8 @@ queue_preview (NautilusPreviewPane *self, gboolean image)
     load->image = image;
     load->document_kind = g_strdup (self->document_kind);
     load->page = self->page;
+    load->folder = self->folder;
+    load->show_hidden = g_settings_get_boolean (gtk_filechooser_preferences, NAUTILUS_PREFERENCES_SHOW_HIDDEN_FILES);
     g_autoptr (GTask) task = g_task_new (self, self->cancellable, preview_loaded, NULL);
     g_task_set_task_data (task, load, preview_load_free);
     self->load_source = g_timeout_add_full (G_PRIORITY_DEFAULT, 120, start_preview,
@@ -449,6 +558,15 @@ change_pdf_page (NautilusPreviewPane *self, int delta)
     gtk_widget_set_sensitive (self->previous_page, FALSE);
     gtk_widget_set_sensitive (self->next_page, FALSE);
     queue_preview (self, TRUE);
+}
+
+static void
+folder_visibility_changed (GSettings *settings, const char *key, NautilusPreviewPane *self)
+{
+    if (!self->folder || self->file == NULL) return;
+    nautilus_preview_pane_cancel (self);
+    gtk_list_box_remove_all (self->folder_list);
+    queue_preview (self, FALSE);
 }
 
 static void
@@ -487,9 +605,12 @@ nautilus_preview_pane_set_files (NautilusPreviewPane *self, GList *files)
     g_clear_pointer (&self->contents, g_free);
     gtk_text_buffer_set_text (gtk_text_view_get_buffer (self->text), "", 0);
     gtk_picture_set_paintable (self->picture, NULL);
+    gtk_list_box_remove_all (self->folder_list);
     gtk_widget_set_visible (GTK_WIDGET (self->source), FALSE);
     gtk_widget_set_visible (self->page_controls, FALSE);
     self->document_kind = NULL;
+    self->folder = FALSE;
+    gtk_button_set_label (GTK_BUTTON (self->open), "Open in application");
     self->page = 1;
     self->total_pages = 0;
     gtk_text_view_set_wrap_mode (self->text, GTK_WRAP_WORD_CHAR);
@@ -502,7 +623,7 @@ nautilus_preview_pane_set_files (NautilusPreviewPane *self, GList *files)
         guint count = g_list_length (files);
         g_autofree char *title = count == 0 ? g_strdup ("Preview") : g_strdup_printf ("%u items selected", count);
         gtk_label_set_text (self->name, title);
-        gtk_label_set_text (self->message, "Select a file to preview it here.");
+        gtk_label_set_text (self->message, "Select a file or folder to preview it here.");
         return;
     }
     NautilusFile *file = files->data;
@@ -518,6 +639,14 @@ nautilus_preview_pane_set_files (NautilusPreviewPane *self, GList *files)
     if (!g_file_is_native (self->file))
     {
         gtk_label_set_text (self->message, "Open this remote file to view its contents.");
+        return;
+    }
+    if (nautilus_file_is_directory (file))
+    {
+        self->folder = TRUE;
+        gtk_label_set_text (self->metadata, "Folder · loading contents…");
+        gtk_button_set_label (GTK_BUTTON (self->open), "Open folder");
+        queue_preview (self, FALSE);
         return;
     }
     gboolean image = mime != NULL && g_str_has_prefix (mime, "image/");
@@ -546,9 +675,7 @@ nautilus_preview_pane_set_files (NautilusPreviewPane *self, GList *files)
     }
     if (!image && !text && self->document_kind == NULL)
     {
-        gtk_label_set_text (self->message, nautilus_file_is_directory (file)
-                            ? "Open this folder to browse its contents."
-                            : "No inline preview for this file type. Use Open to view it.");
+        gtk_label_set_text (self->message, "No inline preview for this file type. Use Open to view it.");
         return;
     }
     self->markdown = g_str_has_suffix (lower_name, ".md") || g_str_has_suffix (lower_name, ".markdown") ||
@@ -634,7 +761,7 @@ nautilus_preview_pane_init (NautilusPreviewPane *self)
     gtk_widget_set_vexpand (GTK_WIDGET (self->stack), TRUE);
     gtk_stack_set_hhomogeneous (self->stack, FALSE);
     gtk_stack_set_vhomogeneous (self->stack, FALSE);
-    self->message = GTK_LABEL (gtk_label_new ("Select a file to preview it here."));
+    self->message = GTK_LABEL (gtk_label_new ("Select a file or folder to preview it here."));
     gtk_label_set_wrap (self->message, TRUE);
     gtk_widget_add_css_class (GTK_WIDGET (self->message), "dim-label");
     gtk_stack_add_named (self->stack, GTK_WIDGET (self->message), "message");
@@ -663,6 +790,13 @@ nautilus_preview_pane_init (NautilusPreviewPane *self)
     gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
     gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (scroll), GTK_WIDGET (self->text));
     gtk_stack_add_named (self->stack, scroll, "text");
+    self->folder_list = GTK_LIST_BOX (gtk_list_box_new ());
+    gtk_list_box_set_selection_mode (self->folder_list, GTK_SELECTION_NONE);
+    gtk_widget_add_css_class (GTK_WIDGET (self->folder_list), "boxed-list");
+    GtkWidget *folder_scroll = gtk_scrolled_window_new ();
+    gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (folder_scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (folder_scroll), GTK_WIDGET (self->folder_list));
+    gtk_stack_add_named (self->stack, folder_scroll, "folder");
     self->sheet = WEBKIT_WEB_VIEW (webkit_web_view_new ());
     WebKitSettings *web_settings = webkit_web_view_get_settings (self->sheet);
     webkit_settings_set_enable_javascript (web_settings, FALSE);
@@ -689,6 +823,9 @@ nautilus_preview_pane_init (NautilusPreviewPane *self)
     gtk_widget_set_sensitive (self->open, FALSE);
     g_signal_connect (self->open, "clicked", G_CALLBACK (open_file), self);
     gtk_box_append (GTK_BOX (self), self->open);
+    g_signal_connect_object (gtk_filechooser_preferences,
+                             "changed::" NAUTILUS_PREFERENCES_SHOW_HIDDEN_FILES,
+                             G_CALLBACK (folder_visibility_changed), self, 0);
 }
 
 GtkWidget *

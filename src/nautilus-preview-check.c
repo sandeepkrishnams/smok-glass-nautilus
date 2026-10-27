@@ -89,6 +89,75 @@ capture (gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+static void
+check_folder_preview (NautilusPreviewPane *pane, GtkWidget *window, NautilusFile *text_file)
+{
+    g_autofree char *root = g_dir_make_tmp ("nautilus-folder-preview-XXXXXX", NULL);
+    g_autofree char *dir = g_build_filename (root, "Project files", NULL);
+    g_mkdir (dir, 0700);
+    g_autofree char *subdir = g_build_filename (dir, "Designs", NULL);
+    g_autofree char *notes = g_build_filename (dir, "Notes & ideas.txt", NULL);
+    g_autofree char *hidden = g_build_filename (dir, ".hidden", NULL);
+    g_autofree char *link = g_build_filename (dir, "Shortcut", NULL);
+    g_mkdir (subdir, 0700);
+    g_file_set_contents (notes, "Folder preview sample", -1, NULL);
+    g_file_set_contents (hidden, "Hidden sample", -1, NULL);
+    g_assert_cmpint (symlink (subdir, link), ==, 0);
+    NautilusFile *folder = ready_file (dir);
+    NautilusFile *empty = ready_file (subdir);
+    g_settings_set_boolean (gtk_filechooser_preferences, NAUTILUS_PREFERENCES_SHOW_HIDDEN_FILES, FALSE);
+    select_file (pane, folder);
+    g_assert_cmpstr (gtk_stack_get_visible_child_name (pane->stack), ==, "folder");
+    g_assert_nonnull (strstr (gtk_label_get_text (pane->metadata), "1 folder · 2 files"));
+    GtkWidget *row = GTK_WIDGET (gtk_list_box_get_row_at_index (pane->folder_list, 0));
+    GtkWidget *box = gtk_list_box_row_get_child (GTK_LIST_BOX_ROW (row));
+    GtkWidget *name = gtk_widget_get_next_sibling (gtk_widget_get_first_child (box));
+    g_assert_cmpstr (gtk_label_get_text (GTK_LABEL (name)), ==, "Designs");
+    g_assert_null (gtk_list_box_get_row_at_index (pane->folder_list, 3));
+    g_assert_cmpstr (gtk_button_get_label (GTK_BUTTON (pane->open)), ==, "Open folder");
+    set_capture_path ("folder-preview.png");
+    pump (400); capture (window);
+    g_print ("PASS folder listing, folders first, literal names, sizes and symlinks\n");
+    g_settings_set_boolean (gtk_filechooser_preferences, NAUTILUS_PREFERENCES_SHOW_HIDDEN_FILES, TRUE);
+    for (guint i = 0; i < 5000 && g_strcmp0 (gtk_stack_get_visible_child_name (pane->stack), "folder") != 0; i++) pump (1);
+    g_assert_nonnull (gtk_list_box_get_row_at_index (pane->folder_list, 3));
+    g_assert_null (gtk_list_box_get_row_at_index (pane->folder_list, 4));
+    g_print ("PASS folder hidden-item preference and clearing old rows\n");
+    select_file (pane, empty);
+    g_assert_cmpstr (gtk_stack_get_visible_child_name (pane->stack), ==, "message");
+    g_assert_cmpstr (gtk_label_get_text (pane->message), ==, "This folder is empty.");
+    g_print ("PASS empty folder state\n");
+    for (guint i = 0; i <= FOLDER_LIMIT; i++)
+    {
+        g_autofree char *path = g_strdup_printf ("%s/item-%03u.txt", subdir, i);
+        g_file_set_contents (path, "sample", -1, NULL);
+    }
+    select_file (pane, empty);
+    g_assert_nonnull (gtk_list_box_get_row_at_index (pane->folder_list, FOLDER_LIMIT - 1));
+    g_assert_null (gtk_list_box_get_row_at_index (pane->folder_list, FOLDER_LIMIT));
+    g_assert_nonnull (strstr (gtk_label_get_text (pane->metadata), "listing limited"));
+    g_print ("PASS bounded large-folder listing\n");
+    GList selection = { .data = folder };
+    nautilus_preview_pane_set_files (pane, &selection);
+    pump (125);
+    select_file (pane, text_file);
+    pump (300);
+    g_assert_cmpstr (gtk_stack_get_visible_child_name (pane->stack), ==, "text");
+    g_assert_null (gtk_list_box_get_row_at_index (pane->folder_list, 0));
+    g_print ("PASS folder selection cancellation and file transition\n");
+    g_settings_set_boolean (gtk_filechooser_preferences, NAUTILUS_PREFERENCES_SHOW_HIDDEN_FILES, FALSE);
+    nautilus_file_monitor_remove (folder, folder);
+    nautilus_file_monitor_remove (empty, empty);
+    remove_preview_directory (root);
+    select_file (pane, folder);
+    g_assert_cmpstr (gtk_stack_get_visible_child_name (pane->stack), ==, "message");
+    g_assert_cmpstr (gtk_label_get_text (pane->message), !=, "Loading preview…");
+    g_assert_cmpstr (gtk_label_get_text (pane->message), !=, "This folder is empty.");
+    g_print ("PASS unavailable folder error state\n");
+    nautilus_file_unref (folder);
+    nautilus_file_unref (empty);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -198,6 +267,7 @@ main (int argc, char **argv)
     gtk_window_present (GTK_WINDOW (window));
     pump (400);
     capture (window);
+    check_folder_preview (pane, window, txt_file);
     const char *document_names[] = {"document.pdf", "document.docx", "sheet.xlsx", "document.odt", "sheet.ods", "sheet.csv", "sheet.tsv"};
     for (guint i = 0; i < G_N_ELEMENTS (document_names); i++)
     {
