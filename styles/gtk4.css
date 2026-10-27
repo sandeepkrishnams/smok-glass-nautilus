@@ -1,0 +1,65 @@
+/* Smoked glass: scoped to GNOME Files and its native folder picker. */
+nautilus-window, window.nautilus-file-chooser,
+window.nautilus-window, window.nautilus-file-chooser {
+  --window-bg-color: rgba(31, 32, 38, 0.83);
+  --window-fg-color: #f0f1f5;
+  --view-bg-color: transparent;
+  --view-fg-color: #f0f1f5;
+  --sidebar-bg-color: rgba(65, 66, 75, 0.44);
+  --sidebar-fg-color: #e0e2eb;
+  --sidebar-backdrop-color: rgba(55, 56, 65, 0.44);
+  --headerbar-bg-color: rgba(60, 61, 70, 0.35);
+  --headerbar-fg-color: #f0f1f5;
+  --headerbar-backdrop-color: rgba(48, 49, 58, 0.35);
+  --accent-bg-color: #66758f;
+  --accent-fg-color: #ffffff;
+  --accent-color: #c2cfe6;
+  --border-color: rgba(225, 230, 245, 0.12);
+  background: rgba(31, 32, 38, 0.83);
+  color: #f0f1f5;
+  border-radius: 18px;
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.16);
+}
+nautilus-window.maximized, window.nautilus-file-chooser.maximized,
+window.nautilus-window.maximized, window.nautilus-file-chooser.maximized {
+  border-radius: 0;
+}
+nautilus-window .navigation-sidebar,
+window.nautilus-window .navigation-sidebar,
+window.nautilus-file-chooser .navigation-sidebar {
+  background: transparent;
+}
+nautilus-window .navigation-sidebar row,
+window.nautilus-window .navigation-sidebar row,
+window.nautilus-file-chooser .navigation-sidebar row {
+  border-radius: 9px;
+  margin: 2px 8px;
+}
+nautilus-window .navigation-sidebar row:selected,
+window.nautilus-window .navigation-sidebar row:selected,
+window.nautilus-file-chooser .navigation-sidebar row:selected {
+  background: rgba(205, 215, 237, 0.15);
+  color: #ffffff;
+}
+nautilus-window .nautilus-pathbar,
+window.nautilus-window .nautilus-pathbar,
+window.nautilus-file-chooser .nautilus-pathbar {
+  background: rgba(220, 226, 244, 0.09);
+  border-radius: 10px;
+}
+nautilus-window .nautilus-list-view,
+window.nautilus-window .nautilus-list-view,
+window.nautilus-file-chooser .nautilus-list-view {
+  background: transparent;
+}
+nautilus-window columnview row:selected,
+window.nautilus-window columnview row:selected,
+window.nautilus-file-chooser columnview row:selected {
+  background: rgba(184, 201, 228, 0.13);
+  color: #ffffff;
+}
+nautilus-window headerbar,
+window.nautilus-window headerbar,
+window.nautilus-file-chooser headerbar {
+  box-shadow: none;
+}

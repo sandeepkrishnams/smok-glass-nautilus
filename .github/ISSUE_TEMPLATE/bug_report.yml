@@ -1,0 +1,27 @@
+name: Bug report
+description: Report a preview or file-manager problem.
+body:
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Distribution, GNOME, GTK, and project version.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs or non-sensitive sample
+      description: Remove personal paths and private document contents before uploading.

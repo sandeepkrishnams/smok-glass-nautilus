@@ -1,0 +1,26 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu:
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: ./scripts/install-deps.sh
+      - name: Build
+        run: ./scripts/build.sh
+      - name: Helper and upstream regression tests
+        run: ./scripts/test.sh
+
+# Native widget/screenshot checks run in a real graphical session using
+# scripts/test-native.sh; nested office sandboxes are not assumed in CI.

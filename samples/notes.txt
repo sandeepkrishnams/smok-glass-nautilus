@@ -1,0 +1,7 @@
+Text preview is ready.
+
+You can select and copy text from this panel, scroll through it, and keep browsing files without opening an editor.
+
+Unicode also works: café · 日本語 · नमस्ते
+
+Large text files show the first 512 KiB. Use Open in application to read the rest.

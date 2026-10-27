@@ -1,0 +1,14 @@
+/build/
+/build-*/
+/.venv/
+/test-artifacts/
+/dist/
+__pycache__/
+*.py[cod]
+*.upstream
+*.log
+core
+core.*
+.DS_Store
+.idea/
+.vscode/
