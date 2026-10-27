@@ -93,6 +93,18 @@ capture (gpointer data)
 }
 
 static void
+wait_for_folder_page (NautilusPreviewPane *pane)
+{
+    gint64 deadline = g_get_monotonic_time () + 10 * G_USEC_PER_SEC;
+    while (pane->folder_loading && g_get_monotonic_time () < deadline)
+    {
+        g_main_context_iteration (NULL, FALSE);
+        g_usleep (1000);
+    }
+    g_assert_false (pane->folder_loading);
+}
+
+static void
 check_folder_preview (NautilusPreviewPane *pane, GtkWidget *window, NautilusFile *text_file)
 {
     g_autofree char *root = g_dir_make_tmp ("nautilus-folder-preview-XXXXXX", NULL);
@@ -112,41 +124,130 @@ check_folder_preview (NautilusPreviewPane *pane, GtkWidget *window, NautilusFile
     select_file (pane, folder);
     g_assert_cmpstr (gtk_stack_get_visible_child_name (pane->stack), ==, "folder");
     g_assert_nonnull (strstr (gtk_label_get_text (pane->metadata), "1 folder · 2 files"));
-    GtkWidget *row = GTK_WIDGET (gtk_list_box_get_row_at_index (pane->folder_list, 0));
-    GtkWidget *box = gtk_list_box_row_get_child (GTK_LIST_BOX_ROW (row));
-    GtkWidget *name = gtk_widget_get_next_sibling (gtk_widget_get_first_child (box));
-    g_assert_cmpstr (gtk_label_get_text (GTK_LABEL (name)), ==, "Designs");
-    g_assert_null (gtk_list_box_get_row_at_index (pane->folder_list, 3));
+    g_autoptr (GFileInfo) first_info = g_list_model_get_item (G_LIST_MODEL (pane->folder_items), 0);
+    g_assert_cmpstr (g_file_info_get_display_name (first_info), ==, "Designs");
+    g_assert_cmpuint (g_list_model_get_n_items (G_LIST_MODEL (pane->folder_items)), ==, 3);
+    g_assert_true (pane->folder_done);
     g_assert_cmpstr (gtk_button_get_label (GTK_BUTTON (pane->open)), ==, "Open folder");
     set_capture_path ("folder-preview.png");
     pump (400); capture (window);
     g_print ("PASS folder listing, folders first, literal names, sizes and symlinks\n");
     g_settings_set_boolean (gtk_filechooser_preferences, NAUTILUS_PREFERENCES_SHOW_HIDDEN_FILES, TRUE);
     for (guint i = 0; i < 5000 && g_strcmp0 (gtk_stack_get_visible_child_name (pane->stack), "folder") != 0; i++) pump (1);
-    g_assert_nonnull (gtk_list_box_get_row_at_index (pane->folder_list, 3));
-    g_assert_null (gtk_list_box_get_row_at_index (pane->folder_list, 4));
+    wait_for_folder_page (pane);
+    g_assert_cmpuint (g_list_model_get_n_items (G_LIST_MODEL (pane->folder_items)), ==, 4);
     g_print ("PASS folder hidden-item preference and clearing old rows\n");
     select_file (pane, empty);
     g_assert_cmpstr (gtk_stack_get_visible_child_name (pane->stack), ==, "message");
     g_assert_cmpstr (gtk_label_get_text (pane->message), ==, "This folder is empty.");
     g_print ("PASS empty folder state\n");
-    for (guint i = 0; i <= FOLDER_LIMIT; i++)
+    guint total = FOLDER_PAGE_SIZE * 17 + 7;
+    for (guint i = 0; i < total; i++)
     {
         g_autofree char *path = g_strdup_printf ("%s/item-%03u.txt", subdir, i);
         g_file_set_contents (path, "sample", -1, NULL);
     }
     select_file (pane, empty);
-    g_assert_nonnull (gtk_list_box_get_row_at_index (pane->folder_list, FOLDER_LIMIT - 1));
-    g_assert_null (gtk_list_box_get_row_at_index (pane->folder_list, FOLDER_LIMIT));
-    g_assert_nonnull (strstr (gtk_label_get_text (pane->metadata), "listing limited"));
-    g_print ("PASS bounded large-folder listing\n");
+    pump (300);
+    g_assert_cmpuint (g_list_model_get_n_items (G_LIST_MODEL (pane->folder_items)), ==, FOLDER_PAGE_SIZE);
+    g_assert_false (pane->folder_done);
+    g_assert_nonnull (pane->folder_enumerator);
+    g_assert_nonnull (strstr (gtk_label_get_text (pane->metadata), "32 items loaded"));
+    g_autoptr (GFileInfo) initial = g_list_model_get_item (G_LIST_MODEL (pane->folder_items), 0);
+    g_print ("PASS folder first page loads only 32 items without enumerating the whole folder\n");
+    GtkAdjustment *adjustment = gtk_scrolled_window_get_vadjustment (pane->folder_scroll);
+    /* Wait for GTK to allocate the new list before simulating a scroll;
+     * the previous empty-folder adjustment can survive until the next frame. */
+    gint64 layout_deadline = g_get_monotonic_time () + 10 * G_USEC_PER_SEC;
+    while ((!gtk_widget_get_mapped (GTK_WIDGET (pane->folder_list)) ||
+            gtk_adjustment_get_page_size (adjustment) <= 0 ||
+            gtk_adjustment_get_upper (adjustment) <= gtk_adjustment_get_page_size (adjustment)) &&
+           g_get_monotonic_time () < layout_deadline)
+    {
+        g_main_context_iteration (NULL, FALSE);
+        g_usleep (1000);
+    }
+    g_assert_true (gtk_widget_get_mapped (GTK_WIDGET (pane->folder_list)));
+    g_assert_cmpfloat (gtk_adjustment_get_upper (adjustment), >, gtk_adjustment_get_page_size (adjustment));
+    gtk_adjustment_set_value (adjustment, gtk_adjustment_get_upper (adjustment) - gtk_adjustment_get_page_size (adjustment));
+    wait_for_folder_page (pane);
+    g_assert_cmpuint (g_list_model_get_n_items (G_LIST_MODEL (pane->folder_items)), ==, 2 * FOLDER_PAGE_SIZE);
+    g_autoptr (GFileInfo) still_first = g_list_model_get_item (G_LIST_MODEL (pane->folder_items), 0);
+    g_assert_true (initial == still_first);
+    g_print ("PASS scrolling appends the next folder page without moving previous entries\n");
+    /* A load in flight must also be cancellable when hidden visibility changes. */
+    request_folder_page (pane);
+    g_assert_true (pane->folder_loading);
+    g_settings_set_boolean (gtk_filechooser_preferences, NAUTILUS_PREFERENCES_SHOW_HIDDEN_FILES, FALSE);
+    wait_for_folder_page (pane);
+    g_assert_cmpuint (g_list_model_get_n_items (G_LIST_MODEL (pane->folder_items)), ==, FOLDER_PAGE_SIZE);
+    for (guint batch = 0; batch < 30 && !pane->folder_done; batch++)
+    {
+        g_signal_emit_by_name (pane->folder_more, "clicked");
+        wait_for_folder_page (pane);
+    }
+    g_assert_true (pane->folder_done);
+    g_assert_null (pane->folder_enumerator);
+    g_assert_cmpuint (g_list_model_get_n_items (G_LIST_MODEL (pane->folder_items)), ==, total);
+    g_autoptr (GHashTable) names = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+    for (guint i = 0; i < total; i++)
+    {
+        g_autoptr (GFileInfo) info = g_list_model_get_item (G_LIST_MODEL (pane->folder_items), i);
+        g_assert_true (g_hash_table_add (names, g_strdup (g_file_info_get_name (info))));
+    }
+    pump (200);
+    guint rows = 0;
+    for (GtkWidget *child = gtk_widget_get_first_child (GTK_WIDGET (pane->folder_list)); child != NULL;
+         child = gtk_widget_get_next_sibling (child)) rows++;
+    g_assert_cmpuint (rows, <, total);
+    g_assert_false (gtk_widget_get_visible (pane->folder_more));
+    g_print ("PASS lazy folder traversal beyond 500 items, unique entries and recycled row widgets\n");
+    nautilus_preview_pane_cancel (pane);
+    gtk_widget_set_visible (GTK_WIDGET (pane), FALSE);
+    g_settings_set_boolean (gtk_filechooser_preferences, NAUTILUS_PREFERENCES_SHOW_HIDDEN_FILES, TRUE);
+    pump (200);
+    g_assert_false (pane->folder_loading);
+    g_assert_null (pane->folder_enumerator);
+    g_settings_set_boolean (gtk_filechooser_preferences, NAUTILUS_PREFERENCES_SHOW_HIDDEN_FILES, FALSE);
+    gtk_widget_set_visible (GTK_WIDGET (pane), TRUE);
+    g_print ("PASS hidden preference changes do not restart a hidden folder preview\n");
+    select_file (pane, empty);
+    request_folder_page (pane);
+    request_folder_page (pane);
+    g_assert_true (pane->folder_loading);
+    select_file (pane, text_file);
+    pump (300);
+    g_assert_cmpuint (g_list_model_get_n_items (G_LIST_MODEL (pane->folder_items)), ==, 0);
+    g_assert_null (pane->folder_enumerator);
+    g_assert_cmpstr (gtk_stack_get_visible_child_name (pane->stack), ==, "text");
+    g_print ("PASS repeated page requests are serialized and selection cancels in-flight continuation\n");
+    g_autofree char *hidden_dir = g_build_filename (root, "Hidden files", NULL);
+    g_mkdir (hidden_dir, 0700);
+    for (guint i = 0; i < FOLDER_SCAN_BATCH + 7; i++)
+    {
+        g_autofree char *path = g_strdup_printf ("%s/.hidden-%03u", hidden_dir, i);
+        g_file_set_contents (path, "", 0, NULL);
+    }
+    NautilusFile *hidden_folder = ready_file (hidden_dir);
+    select_file (pane, hidden_folder);
+    g_assert_false (pane->folder_done);
+    g_assert_cmpuint (g_list_model_get_n_items (G_LIST_MODEL (pane->folder_items)), ==, 0);
+    g_assert_true (gtk_widget_get_visible (pane->folder_more));
+    g_assert_nonnull (strstr (gtk_label_get_text (pane->folder_status), "No visible items in this batch"));
+    g_signal_emit_by_name (pane->folder_more, "clicked");
+    wait_for_folder_page (pane);
+    g_assert_true (pane->folder_done);
+    g_assert_cmpstr (gtk_label_get_text (pane->message), ==, "No visible items in this folder.");
+    nautilus_file_monitor_remove (hidden_folder, hidden_folder);
+    nautilus_file_unref (hidden_folder);
+    g_print ("PASS hidden-heavy folders use bounded scan batches and continue from the same cursor\n");
     GList selection = { .data = folder };
     nautilus_preview_pane_set_files (pane, &selection);
     pump (125);
     select_file (pane, text_file);
     pump (300);
     g_assert_cmpstr (gtk_stack_get_visible_child_name (pane->stack), ==, "text");
-    g_assert_null (gtk_list_box_get_row_at_index (pane->folder_list, 0));
+    g_assert_cmpuint (g_list_model_get_n_items (G_LIST_MODEL (pane->folder_items)), ==, 0);
     g_print ("PASS folder selection cancellation and file transition\n");
     g_settings_set_boolean (gtk_filechooser_preferences, NAUTILUS_PREFERENCES_SHOW_HIDDEN_FILES, FALSE);
     nautilus_file_monitor_remove (folder, folder);
@@ -339,6 +440,15 @@ main (int argc, char **argv)
         g_assert_true (folder_pane->folder);
         g_assert_true (g_strcmp0 (gtk_stack_get_visible_child_name (folder_pane->stack), "folder") == 0 ||
                        g_str_has_prefix (gtk_label_get_text (folder_pane->message), "No visible items"));
+        if (!folder_pane->folder_done && g_list_model_get_n_items (G_LIST_MODEL (folder_pane->folder_items)) > 0)
+        {
+            guint before = g_list_model_get_n_items (G_LIST_MODEL (folder_pane->folder_items));
+            request_folder_page (folder_pane);
+            wait_for_folder_page (folder_pane);
+            g_assert_false (folder_pane->folder_error);
+            g_assert_cmpuint (g_list_model_get_n_items (G_LIST_MODEL (folder_pane->folder_items)), >=, before);
+            g_print ("PASS GIO folder cursor continuation\n");
+        }
         nautilus_preview_pane_cancel (folder_pane);
         g_object_unref (folder_pane);
         nautilus_file_monitor_remove (folder, folder);
@@ -451,6 +561,7 @@ main (int argc, char **argv)
     pump (400);
     capture (window);
     check_folder_preview (pane, window, txt_file);
+    if (argc > 1 && g_str_equal (argv[1], "--folder-only")) goto preview_check_cleanup;
     check_video_preview (pane, window, txt_file);
     check_hover_preview (txt_file, md_file);
     const char *document_names[] = {"document.pdf", "document.docx", "sheet.xlsx", "document.odt", "sheet.ods", "sheet.csv", "sheet.tsv"};
@@ -515,6 +626,7 @@ main (int argc, char **argv)
         nautilus_file_monitor_remove (document, document);
         nautilus_file_unref (document);
     }
+preview_check_cleanup:
     nautilus_preview_pane_set_files (pane, &first);
     nautilus_preview_pane_cancel (pane);
     gtk_window_destroy (GTK_WINDOW (window));

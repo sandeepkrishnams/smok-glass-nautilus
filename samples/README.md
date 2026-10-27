@@ -4,6 +4,7 @@ Select a file once to preview it on the right.
 
 ## Try it
 
+- Select a folder for a lazy contents preview; scroll or use **Load more** to fetch the next batch.
 - Click **notes.txt** for a scrollable text preview.
 - Click **video.mp4**, then press Play for a video preview with seeking and volume. This four-second test-pattern clip and tone were generated with FFmpeg; turn down the volume before unmuting.
 - Hover briefly over any file for a temporary preview without changing selection.

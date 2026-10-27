@@ -4,6 +4,10 @@ A Nautilus file manager with a built-in, read-only preview pane. Select a file o
 
 Based on **GNOME Nautilus 50.2.2**. This repository contains the complete modified source, local document readers, sample files, and per-user installation tools.
 
+![Smok Glass Nautilus with transparent styling, file icons, and the Markdown preview pane](docs/screenshots/smok-glass-desktop.png)
+
+Smoked-glass styling with an embedded Markdown preview.
+
 ## See it
 
 ### Spreadsheet preview
@@ -14,7 +18,7 @@ Column letters, row numbers, worksheet tabs, merged cells, colours, borders, and
 
 ### Folder preview
 
-Select a folder to see its immediate files and subfolders, with folders first, file icons, sizes, and an item summary. **Ctrl+H** also updates hidden items in the preview.
+Select a folder to see the first 32 files and subfolders immediately, then scroll to fetch more. Rows are recycled as you browse; **Load more** is also available for keyboard access. Each batch puts folders first and sorts names naturally, while previously loaded rows stay in place. **Ctrl+H** also updates hidden items in the preview.
 
 <img src="docs/screenshots/folder-preview.png" alt="A folder preview listing subfolders, files and a shortcut" width="390">
 
@@ -36,7 +40,8 @@ These are real captures from the native preview widget using the sample files in
 
 - Embedded, resizable right preview pane; **Ctrl+Shift+P** toggles it.
 - Single-click and arrow-key selection update the preview. Hover over an item briefly for a temporary preview without changing selection; leaving restores the selection preview. Double-click opens the file normally.
-- Folder contents with folders first, file icons and sizes, hidden-item preference, and empty-folder states.
+- Lazy folder previews: 32 items per batch, automatic loading near the bottom, recycled list rows, and a keyboard-accessible Load more button.
+- Folder icons, sizes, hidden-item preference, and empty-folder states.
 - Rendered Markdown with a source toggle; scrollable, selectable plain text.
 - Video playback with native GTK media controls; no autoplay.
 - Image previews through GNOME's sandboxed Glycin loaders.
@@ -96,6 +101,7 @@ Existing system Nautilus extension modules are reused where available. The defau
 | Play/pause, seek, volume | Video controls (move the pointer over the player to reveal them) |
 | Resize pane | Drag its divider |
 | Browse document pages | Previous/Next buttons beneath the page |
+| Browse more folder contents | Scroll toward the bottom, or use **Load more** |
 | Change worksheet | Tabs beneath the spreadsheet grid |
 | Read Markdown source | **Show Markdown source** |
 | Edit/open a file | Double-click it or use **Open in application** |
@@ -103,7 +109,8 @@ Existing system Nautilus extension modules are reused where available. The defau
 ## Preview limits
 
 - File-content previews support local files only; unsupported and remote files offer the normal Open action. Folder listings also support locations available through GIO, including mounted network folders.
-- Folder previews list immediate children only, with up to 500 visible items and 10,000 entries scanned. Limited previews say so; use **Open folder** to browse the full listing. Symlinks inside a folder are listed without following their targets.
+- Folder previews read immediate children in pages of up to 32 visible items, scanning at most 256 entries per request when filtering hidden files. Scrolling fetches the next page; there is no longer a 500-item total limit. A hidden-only batch offers **Load more** to continue without scanning the entire folder automatically.
+- Folder counts describe loaded items until the directory ends. Each batch is sorted with folders first; the complete directory is not scanned for a global sort. Symlinks inside a folder are listed without following their targets.
 - Videos stream from local files without the image/document size cap; damaged files or missing codecs show an Open fallback. Playback remains paused until you press Play.
 - Text previews stop after 512 KiB. Document and image input files above 100 MiB show a fallback.
 - Spreadsheet previews show up to 5 visible sheets, 200 rows and 30 columns per sheet.
